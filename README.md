@@ -32,7 +32,7 @@ NOTE: As the python requirements for Mesh Transformer and pytorch3D are differen
 
 ### Hand models
 - Download smplx and put it in ``` ./hand_models/```.
-- Replace ```./hand_models/smplx/smplx/body_models.py``` and ```./hand_models/smplx/smplx/__init__.py``` with our version.
+- Replace ```./hand_models/smplx/smplx/body_models.py``` and ```./hand_models/smplx/smplx/__init__.py``` with our version in ```./hand_models_harp/```.
 - Download MANO and put it in the root directory ``` ./mano/``` and ``` ./manopth/```.
 
 
