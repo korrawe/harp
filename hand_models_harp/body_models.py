@@ -1046,12 +1046,12 @@ class MANOARM(SMPL):
         self.register_buffer('pose_mean', pose_mean_tensor)
 
         # Create a buffer for right arm indices
-        right_arm_idx_list_path = "/home/korrawe/photometric_hand/arm/arm_vert.npy"
+        right_arm_idx_list_path = "template/arm/arm_vert.npy"
         right_arm_idx = np.load(right_arm_idx_list_path)
         right_arm_idx_tensor = torch.tensor(right_arm_idx)
         self.register_buffer('right_arm_idx', right_arm_idx_tensor)
 
-        right_arm_face_path = "/home/korrawe/photometric_hand/arm/arm_face.npy"
+        right_arm_face_path = "template/arm/arm_face.npy"
         right_arm_faces = np.load(right_arm_face_path)
         self.faces = right_arm_faces
         self.register_buffer('faces_tensor',
@@ -2098,21 +2098,16 @@ class SMPLXARM(SMPLH):
 
 
         # Load arm correspondances
-        arm_corr_filename = "/home/korrawe/photometric_hand/arm/smplx_arm_corr.pkl"
+        arm_corr_filename = "template/arm/smplx_arm_corr.pkl"
         with open(arm_corr_filename, 'rb') as f:
             arm_corr = pickle.load(f)
 
         # Create a buffer for right arm indices
-        # right_arm_idx_list_path = "/home/korrawe/photometric_hand/arm/smplx_arm_vert.npy"
-        # right_arm_idx = np.load(right_arm_idx_list_path)
         right_arm_idx_tensor = torch.tensor(arm_corr['arm_vert'])
         self.register_buffer('right_arm_idx', right_arm_idx_tensor)
 
         right_mano_idx_tensor = torch.tensor(arm_corr['mano_vert_from_arm']) # MANO vertex indices from arm mesh
         self.register_buffer('right_mano_idx', right_mano_idx_tensor)
-
-        # right_arm_face_path = "/home/korrawe/photometric_hand/arm/smplx_arm_face.npy"
-        # right_arm_faces = np.load(right_arm_face_path)
 
         self.faces = arm_corr['face']  # right_arm_faces
         self.register_buffer('right_arm_faces_tensor',
