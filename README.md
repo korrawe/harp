@@ -31,7 +31,6 @@ The code is tested on Ubuntu 20.04 with python 3.8.
 <details>
   <summary>Installation with python 3.9</summary>
 
-  ### Heading
   1. Create a conda env with python 3.9: <p>
       ```
       conda create -n harp python=3.9 && conda activate harp
