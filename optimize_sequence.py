@@ -230,21 +230,12 @@ def init_params(input_params, VERT_DISPS, VERT_DISPS_NORMALS, VERTS_COLOR, mano_
             params['nimble_tex'] =  torch.nn.Parameter(torch.zeros([1, 10]), requires_grad=True)
             params['uv_mask'] = None
         else:
-            start_from_template_text = False # True
-            if start_from_template_text:
-                template_dir = "/home/korrawe/photometric_hand/p_hand/exp/final_3dv/rebuttal/seq1_base/"
-                pkl_path = os.path.join(template_dir, "saved_params.pkl")
-                with open(pkl_path, 'rb') as infile:
-                    temp_params = pickle.load(infile)
-                pred_texture = temp_params['texture'].clip(0,1)
-                params['texture'] =  torch.nn.Parameter(torch.from_numpy(pred_texture), requires_grad=True)
-            else:
-                # Initialized with Skin color
-                params['texture'] =  torch.nn.Parameter(torch.tensor([232, 190, 172]).repeat(1, 512, 512, 1) / 255., requires_grad=True)               
-                # Prepare UV mask according to texture size
-                params['uv_mask'] = load_uv_mask(configs, params['texture'].shape[1:3])
-                # Normal map. Initialize in normal space (not color space)
-                params['normal_map'] =  torch.nn.Parameter(torch.tensor([0.0, 0.0, 1.0]).repeat(1, 512, 512, 1), requires_grad=True)
+            # Initialized with Skin color
+            params['texture'] =  torch.nn.Parameter(torch.tensor([232, 190, 172]).repeat(1, 512, 512, 1) / 255., requires_grad=True)               
+            # Prepare UV mask according to texture size
+            params['uv_mask'] = load_uv_mask(configs, params['texture'].shape[1:3])
+            # Normal map. Initialize in normal space (not color space)
+            params['normal_map'] =  torch.nn.Parameter(torch.tensor([0.0, 0.0, 1.0]).repeat(1, 512, 512, 1), requires_grad=True)
 
     # Light position for each frames
     total_frame = input_params['cam'].shape[0]
