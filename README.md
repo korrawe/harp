@@ -19,7 +19,7 @@
 
 # Running the code
 ## Dependencies
-- ```requirements.txt```
+- ```requirements.txt``` or ```requirements_reduce.txt```
 - [MANO model](https://github.com/hassony2/manopth) for hand only model
 - [SMPLX model](https://smpl-x.is.tue.mpg.de/) for hand and arm model
 - [Mesh Transformer](https://github.com/microsoft/MeshTransformer) for initial hand mesh prediction on new videos
@@ -28,7 +28,32 @@ The easiest way to run the code is to use [conda](https://docs.conda.io/en/lates
 
 The code is tested on Ubuntu 20.04 with python 3.8.
 
-NOTE: As the python requirements for Mesh Transformer and pytorch3D are different, they need to be installed in separate conda environments.
+<details>
+  <summary>Installation with python 3.9</summary>
+
+  ### Heading
+  1. Create a conda env with python 3.9: <p>
+      ```
+      conda create -n harp python=3.9 && conda activate harp
+      ```
+  2. Install requirements for pytorch3d version 0.6.2: <p>
+     ```
+     conda install pytorch==1.11.0 torchvision==0.12.0 cudatoolkit=11.3 -c pytorch
+     conda install -c fvcore -c iopath -c conda-forge fvcore iopath
+     ```
+  3. Install pytorch3d version 0.6.2: <p>
+      ```
+      conda install pytorch3d=0.6.2 -c pytorch3d
+      ```
+  4. Install other packages: <p>
+     ```
+     pip install -r requirements_reduce.txt
+     ```
+
+  For other version of python and pytorch, check a good summary from mJones00 [here](https://github.com/korrawe/harp/issues/2).
+</details>
+
+<b>NOTE</b>: As the python requirements for Mesh Transformer and pytorch3D are different, they need to be installed in separate conda environments.
 
 ### Hand models
 - Download smplx and put it in ``` ./hand_models/```.

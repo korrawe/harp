@@ -1,0 +1,12 @@
+tensorboard
+lpips
+pytorch_msssim
+chumpy # then comment "#from numpy import bool, int, float, complex, object, unicode, str, nan, inf "in /home/xx/moniconda3/envs/harp/lib/python3.9/site-packages/chumpy/__init__.py
+scikit-learn
+scipy
+matplotlib
+scikit-image 
+matplotlib 
+imageio 
+plotly 
+opencv-python

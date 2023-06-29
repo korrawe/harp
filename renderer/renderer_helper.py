@@ -16,7 +16,7 @@ from pytorch3d.renderer import (
 )
 from pytorch3d.renderer.mesh.shader import ShaderBase
 from pytorch3d.ops import interpolate_face_attributes
-from pytorch3d.common.types import Device
+from pytorch3d.common.datatypes import Device
 from pytorch3d.renderer.mesh.rasterizer import Fragments
 from typing import Optional
 from pytorch3d.renderer.utils import TensorProperties
