@@ -15,7 +15,7 @@
 ## Updates
 
 - June 20, 2023: Initial release with preprocessed data.
-- TBA End of June: How to process new video.
+- July 3, 2023: How to process new video.
 
 # Running the code
 ## Dependencies
@@ -77,12 +77,32 @@ The output images are in the ```exp``` folder as set in ```config_utils.py```.
 <!-- The provided sample sequence are   . -->
 
 
-## Processing new video (TBA)
-### Detailed steps will be updated soon.
+## Processing new video
+<details>
+  <summary>MeshTransformer Installation</summary>
+
+  1. Install MeshTransformer following their [repo](https://github.com/microsoft/MeshTransformer)
+  2. Copy the following files in ```./metro_modifications``` and replace the files in ```./MeshTransformer/metro```:
+     ```
+     ./MeshTransformer/metro/tools/end2end_inference_handmesh.py
+     ./MeshTransformer/metro/hand_utils/hand_utils.py
+     ./MeshTransformer/metro/utils/renderer.py
+     ```
+  3. Set the ```SMPLX_PATH``` in [end2end_inference_handmesh.py](https://github.com/korrawe/harp/blob/master/metro_modifications/end2end_inference_handmesh.py#L40)
+  4. Set the new sequence path at [L150](https://github.com/korrawe/harp/blob/master/metro_modifications/end2end_inference_handmesh.py#L150): <p>
+
+</details>
+
+## Segmentation and fitting
 - Get the hand segmentation mask using [Unscreen](https://www.unscreen.com/) or [RVM](https://peterl1n.github.io/RobustVideoMatting/) or any other tool. We used RVM for the sample sequence from InterHand2.6M and Unscreen in other cases.
 - Put them in the same structure as in the sample sequence.
+- For output from Unscreen, you can use ```ffmpeg``` to split the video into frames. 
+  ```
+  ffmpeg -i ${SEQ}.gif -vsync 0 ${SEQ}/unscreen/%04d.png
+  ```
+  - The ```end2end_inference_handmesh``` has the option to convert empty background into white background.
 - Run METRO to get the initial hand mesh
-- Fit the hand model to METRO output. This step is needed as METRO only predicts the vertex locations.
+- (Run by default) Fit the hand model to METRO output. This step is needed as METRO only predicts the vertex locations. 
 - Change the path in ```utils/config_utils.py``` and run ```python optmize_sequence.py```.
 
 # BibTex
