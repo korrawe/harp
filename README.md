@@ -5,7 +5,7 @@
 
 ### Korrawe Karunratanakul, Sergey Prokudin, Otmar Hilliges, Siyu Tang <br/>  ETH Zurich
 
-![harp_teaser](/assets/teaser.jpg "HARP teaser")
+![harp_teaser](./assets/teaser.jpg "HARP teaser")
 
 [![report](https://img.shields.io/badge/Project-Page-blue)](https://korrawe.github.io/harp-project/)
 [![report](https://img.shields.io/badge/ArXiv-Paper-red)](https://arxiv.org/abs/2212.09530)
@@ -14,8 +14,8 @@
 
 ## Updates
 
-- June 20, 2023: Initial release with preprocessed data.
-- July 3, 2023: How to process new video.
+- June 20, 2023: Initial release with sample preprocessed data.
+- July 3, 2023: How to process new video. Added all preprocessed data from subject one.
 
 # Running the code
 ## Dependencies
@@ -26,7 +26,7 @@
 
 The easiest way to run the code is to use [conda](https://docs.conda.io/en/latest/miniconda.html).
 
-The code is tested on Ubuntu 20.04 with python 3.8.
+The code is tested on Ubuntu 20.04 with python 3.8 and 3.9.
 
 <details>
   <summary>Installation with python 3.9</summary>
@@ -63,8 +63,9 @@ The code is tested on Ubuntu 20.04 with python 3.8.
 ## Avatar from preprocessed video
 <!-- ![vid](/assets/halo_hand.gif "HALO teaser") -->
 ### Preprocessed sequence
-- Download the preprocessed sequence from [here](https://drive.google.com/file/d/1KLMvehpEAXR8lkjHHX4q4E6mgAHOTwM3/view?usp=sharing)
+- Download the sample preprocessed sequence from [here](https://drive.google.com/file/d/1KLMvehpEAXR8lkjHHX4q4E6mgAHOTwM3/view?usp=sharing)
 - Put the data in ```../data/```. The path can be changed in ```utils/config_utils.py```.
+- Released data (from one subject, with different appearance variations) can be found [here](https://polybox.ethz.ch/index.php/s/EDvgrNXiOLNyPYp)
 
 ### Running the optimization
 To start optimizing the sequence from the coarse initialization, run:
@@ -73,9 +74,6 @@ python optmize_sequence.py
 ```
 
 The output images are in the ```exp``` folder as set in ```config_utils.py```. 
-
-<!-- The provided sample sequence are   . -->
-
 
 ## Processing new video
 <details>
@@ -96,12 +94,20 @@ The output images are in the ```exp``` folder as set in ```config_utils.py```.
 ## Segmentation and fitting
 - Get the hand segmentation mask using [Unscreen](https://www.unscreen.com/) or [RVM](https://peterl1n.github.io/RobustVideoMatting/) or any other tool. We used RVM for the sample sequence from InterHand2.6M and Unscreen in other cases.
 - Put them in the same structure as in the sample sequence.
-- For output from Unscreen, you can use ```ffmpeg``` to split the video into frames. 
+- For output from Unscreen, you can download the ```.gif``` file then use ```ffmpeg``` to split the video into frames.
   ```
+  SEQ=name
+  mkdir ${SEQ}
+  mkdir ${SEQ}/image
+  mkdir ${SEQ}/unscreen
+  ffmpeg -i ${SEQ}.mp4 -vf fps=30 ${SEQ}/image/%04d.png
   ffmpeg -i ${SEQ}.gif -vsync 0 ${SEQ}/unscreen/%04d.png
   ```
-  - The ```end2end_inference_handmesh``` has the option to convert empty background into white background.
+  - The ```end2end_inference_handmesh``` has the option to convert empty background from Unscreen into white background with the flag ```--do_crop```.
 - Run METRO to get the initial hand mesh
+  ```
+  python ./metro/tools/end2end_inference_handmesh.py --resume_checkpoint ./models/metro_release/metro_hand_state_dict.bin --image_file_or_path PATH --do_crop
+  ```
 - (Run by default) Fit the hand model to METRO output. This step is needed as METRO only predicts the vertex locations. 
 - Change the path in ```utils/config_utils.py``` and run ```python optmize_sequence.py```.
 
@@ -116,9 +122,9 @@ The output images are in the ```exp``` folder as set in ```config_utils.py```.
 ```
 
 
-## Code References
+# Code References
 
-Parts of the code are based on the following repositories please consider citing them in the relevant context:
+Parts of the code are based on the following repositories. Please consider citing them in the relevant context:
 
 - The ```body_models``` is built on top of the base class from [SMPLX](https://smpl-x.is.tue.mpg.de/) which falls under their license.
 - The renderer are based on the renderer from [Pytorch3D](https://pytorch3d.org/).
