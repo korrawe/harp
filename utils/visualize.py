@@ -15,6 +15,7 @@ from renderer.pbr_materials import PBRMaterials
 
 def prepare_mesh(params, fid, mano_layer, verts_textures, mesh_subdivider, global_pose, configs, device='cuda', 
         vis_normal=False, shared_texture=True, use_arm=False):
+    """Return mesh with texture and material properties in world coordinates."""
     batch_size = fid.shape[0]  # params['pose'].shape[0]
 
     global_pose = False
@@ -42,7 +43,7 @@ def prepare_mesh(params, fid, mano_layer, verts_textures, mesh_subdivider, globa
         hand_verts, hand_joints = mano_layer(torch.cat((rot_batch, pose_batch), 1).to(device),
                 params['shape'].repeat([batch_size, 1]).to(device),
                 params['trans'][fid].to(device))
-    hand_verts = hand_verts / 1000.0
+    hand_verts = hand_verts / 1000.0 # in meter
     hand_joints = hand_joints / 1000.0
     faces = params['mesh_faces'].repeat(batch_size, 1, 1)
 

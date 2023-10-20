@@ -22,8 +22,8 @@ def get_config(yaml_file=None):
         "total_epoch": 301,
         # [shape, shape and appearance, appearance only]
         "training_stage": [100, 100, 100],
-        "metro_output_dir": "../data/sample_data/1/",
-        "image_dir": "../data/sample_data/1/",
+        "metro_output_dir": "./data/sample_data/1/",
+        "image_dir": "./data/sample_data/1/",
         "train_list": ["1", "2"],
         "val_list": ["1", "2"],
         "gt_mesh_dir": "",

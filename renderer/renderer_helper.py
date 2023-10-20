@@ -461,7 +461,8 @@ def process_info_for_shadow(cam, light_positions, hand_verts_center, image_size,
 
     # Project light position to the surface of a sphere around hand vertex center
     radius = 1.5 # 1.0
-    cam_at_light_t_r = hand_verts_center + (cam_at_light_t - hand_verts_center) * (radius / torch.linalg.norm(cam_at_light_t - hand_verts_center, dim=1, keepdim=True))
+    cam_at_light_t_r = hand_verts_center + \
+    (cam_at_light_t - hand_verts_center) * (radius / torch.linalg.norm(cam_at_light_t - hand_verts_center, dim=1, keepdim=True))
     
     light_R = look_at_rotation(cam_at_light_t_r, at=hand_verts_center, up=((0, 1, 0),)).to(device)  # (1, 3, 3)
     light_T = -torch.bmm(light_R.transpose(1, 2), cam_at_light_t_r[:, :, None])[:, :, 0]   # (1, 3)

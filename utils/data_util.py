@@ -85,6 +85,15 @@ def load_multiple_sequences(metro_output_dir, image_dir, max_size=0, val=False, 
             immediately after the training set for validation.
 
     '''
+    # mano可以返回的是世界系里的坐标
+
+    # cam: camera_t = torch.stack([-cam[:, 1], -cam[:, 2], 2 * focal_length/(img_size * cam[:, 0] +1e-9)], dim=1)
+    # R_batch = torch.Tensor([[-1., 0., 0.], [0., -1., 0.], [0., 0., 1.]]).repeat(batch_size, 1, 1).to(device)
+    # X_cam = X_world R + T
+
+    # pose: parametric model's param
+    # rot: parametric model's base rotation
+    # trans: parametric model's base translation
     if use_smooth_seq:
         pkl_folder = "metro_mano_smooth"
     else:
