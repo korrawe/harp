@@ -40,6 +40,23 @@ torch.cuda.set_device(0)
 np.random.seed(0)
 DEBUG = False
 
+def geometry_guided_near_far_torch(orig, dir, vert, geo_threshold=0.01):
+    """Compute near and far for each ray"""
+    num_vert = vert.shape[0]
+    num_rays = orig.shape[0]
+    orig_ = torch.repeat_interleave(orig[:, None, :], num_vert, 1)
+    dir_ = torch.repeat_interleave(dir[:, None, :], num_vert, 1)
+    vert_ = torch.repeat_interleave(vert[None, ...], num_rays, 0)
+    orig_v = vert_ - orig_
+    z0 = torch.einsum('ij,ij->i', orig_v.reshape(-1, 3), dir_.reshape(-1, 3)).reshape(num_rays, num_vert)
+    dz = torch.sqrt(geo_threshold**2 - (torch.norm(orig_v, dim=2)**2 - z0**2))
+    near = z0 - dz
+    near[near != near] = float('inf')
+    near = near.min(dim=1)[0]
+    far = z0 + dz
+    far[far != far] = float('-inf')
+    far = far.max(dim=1)[0]
+    return near, far # shape (num_rays,)
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
@@ -90,7 +107,7 @@ def batchify_rays(rays_flat, chunk=1024 * 32, need_alpha=False, detach_weights=F
 def render(H, W, focal, chunk=1024 * 32, rays=None, c2w=None, ndc=True,
            near=0., far=1.,
            use_viewdirs=False, c2w_staticcam=None, depths=None, need_alpha=False, detach_weights=False,
-           patch=None,
+           patch=None,hand_infos=None,
            **kwargs):
     """Render rays
     Args:
@@ -108,13 +125,18 @@ def render(H, W, focal, chunk=1024 * 32, rays=None, c2w=None, ndc=True,
       use_viewdirs: bool. If True, use viewing direction of a point in space in model.
       c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for
        camera while using other c2w argument for viewing directions.
+      hand_infos:dict,
+        th_to_action_verts: (Verts,4,4),
+        faces : (Faces,3)
+        hand_verts: (Verts,3)
+
     Returns:
       rgb_map: [batch_size, 3]. Predicted RGB values for rays.
       disp_map: [batch_size]. Disparity map. Inverse of depth.
       acc_map: [batch_size]. Accumulated opacity (alpha) along a ray.
       extras: dict with everything returned by render_rays().
     """
-    
+
     rays_o, rays_d = get_rays(H, W, focal, c2w)
 
     if use_viewdirs:
@@ -128,12 +150,13 @@ def render(H, W, focal, chunk=1024 * 32, rays=None, c2w=None, ndc=True,
 
     sh = rays_d.shape  # [..., 3]
     if ndc:
-        # for forward facing scenes
         rays_o, rays_d = ndc_rays(H, W, focal, 1., rays_o, rays_d)
 
     # Create ray batch
     rays_o = torch.reshape(rays_o, [-1, 3]).float()
     rays_d = torch.reshape(rays_d, [-1, 3]).float()
+
+    near, far = geometry_guided_near_far_torch(rays_o, rays_d, hand_verts ,geo_threshold=0.1)
 
     near, far = near * \
         torch.ones_like(rays_d[..., :1]), far * \
@@ -702,7 +725,7 @@ def render_rays(ray_batch,
                                                                    None]  # [N_rays, N_samples + N_importance, 3]
 
         run_fn = network_fn if network_fine is None else network_fine
-        #         raw = run_network(pts, fn=run_fn)
+
         raw = network_query_fn(pts, viewdirs, run_fn)
 
         rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
@@ -727,6 +750,109 @@ def render_rays(ray_batch,
         depths = ray_batch[:, 8]
         ret['sigma_loss'] = sigma_loss.calculate_loss(rays_o, rays_d, viewdirs, near, far, depths, network_query_fn,
                                                       network_fine)
+
+    for k in ret:
+        if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
+            print(f"! [Numerical Error] {k} contains nan or inf.")
+
+    return ret
+
+def render_rays_given_pts(pts,rays_o,rays_d,z_vals,
+                network_fn,
+                network_query_fn,
+                retraw=False,
+                perturb=0.,
+                N_importance=0,
+                network_fine=None,
+                white_bkgd=False,
+                raw_noise_std=0.,
+                pytest=False,
+                # sigma_loss=None,
+                need_alpha=False,
+                detach_weights=False
+                ):
+    """Volumetric rendering.
+    Args:
+      network_fn: function. Model for predicting RGB and density at each point
+        in space.
+      network_query_fn: function used for passing queries to network_fn.
+      N_samples: int. Number of different times to sample along each ray.
+      retraw: bool. If True, include model's raw, unprocessed predictions.
+      lindisp: bool. If True, sample linearly in inverse depth rather than in depth.
+      perturb: float, 0 or 1. If non-zero, each ray is sampled at stratified
+        random points in time.
+      N_importance: int. Number of additional times to sample along each ray.
+        These samples are only passed to network_fine.
+      network_fine: "fine" network with same spec as network_fn.
+      white_bkgd: bool. If True, assume a white background.
+      raw_noise_std: ...
+      verbose: bool. If True, print more debugging info.
+    Returns:
+      rgb_map: [num_rays, 3]. Estimated RGB color of a ray. Comes from fine model.
+      disp_map: [num_rays]. Disparity map. 1 / depth.
+      acc_map: [num_rays]. Accumulated opacity along each ray. Comes from fine model.
+      raw: [num_rays, num_samples, 4]. Raw predictions from model.
+      rgb0: See rgb_map. Output for coarse model.
+      disp0: See disp_map. Output for coarse model.
+      acc0: See acc_map. Output for coarse model.
+      z_std: [num_rays]. Standard deviation of distances along ray for each
+        sample.
+    """
+    viewdirs=rays_d/rays_d.norm(dim=-1,keepdim=True)
+
+    if network_fn is not None:
+        raw = network_query_fn(pts, viewdirs, network_fn)
+        rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
+                                                                            white_bkgd, pytest=pytest,
+                                                                            need_alpha=need_alpha,
+                                                                            detach_weights=detach_weights)
+    else:
+        if network_fine.alpha_model is not None:
+            raw = network_query_fn(pts, viewdirs, network_fine.alpha_model)
+            rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
+                                                                                white_bkgd, pytest=pytest,
+                                                                                need_alpha=need_alpha,
+                                                                                detach_weights=detach_weights)
+        else:
+            raw = network_query_fn(pts, viewdirs, network_fine)
+            rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
+                                                                                white_bkgd, pytest=pytest,
+                                                                                need_alpha=need_alpha,
+                                                                                detach_weights=detach_weights)
+
+    if N_importance > 0:
+        rgb_map_0, disp_map_0, acc_map_0, alpha0 = rgb_map, disp_map, acc_map, alpha
+
+        z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+        z_samples = sample_pdf(
+            z_vals_mid, weights[..., 1:-1], N_importance, det=(perturb == 0.), pytest=pytest)
+        z_samples = z_samples.detach()
+
+        z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :,
+                                                                   None]  # [N_rays, N_samples + N_importance, 3]
+
+        run_fn = network_fn if network_fine is None else network_fine
+
+        raw = network_query_fn(pts, viewdirs, run_fn)
+
+        rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
+                                                                            white_bkgd, pytest=pytest,
+                                                                            need_alpha=need_alpha,
+                                                                            detach_weights=detach_weights)
+
+    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map, 'depth_map': depth_map,
+           'weights': weights, 'z_vals': z_vals}
+    if retraw:
+        ret['raw'] = raw
+    if need_alpha:
+        ret['alpha'] = alpha
+        ret['alpha0'] = alpha0
+    if N_importance > 0:
+        ret['rgb0'] = rgb_map_0
+        ret['disp0'] = disp_map_0
+        ret['acc0'] = acc_map_0
+        ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:

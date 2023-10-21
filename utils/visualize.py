@@ -88,6 +88,107 @@ def prepare_mesh(params, fid, mano_layer, verts_textures, mesh_subdivider, globa
         mesh = Meshes(hand_verts.to(device), faces.to(device), textures.to(device))
     return hand_joints.to(device), hand_verts.to(device), faces.to(device), textures.to(device) # mesh
 
+def prepare_mesh_NeRF(params, fid, mano_layer, verts_textures, mesh_subdivider, global_pose, configs, device='cuda', 
+        vis_normal=False, shared_texture=True, use_arm=False):
+    """Return mesh with texture and material properties in world coordinates."""
+    batch_size = fid.shape[0]  # params['pose'].shape[0]
+
+    global_pose = False
+    if global_pose:
+        # Use the first pose parameter if global_pose is true
+        pose_batch = params['pose'][0].repeat(batch_size, 1)
+        rot_batch = params['rot'][0].repeat(batch_size, 1)
+    else:
+        pose_batch = params['pose'][fid]
+        rot_batch = params['rot'][fid]
+    
+    if configs['model_type'] == 'nimble':
+        cur_shape = params['shape'].repeat([batch_size, 1]).to(device)
+        tex_param = params['nimble_tex'].repeat([batch_size, 1]).to(device)
+        # Note that the joints here is NIMBLE bone joint
+        hand_verts, muscle_v, bone_v, hand_joints, tex_img = mano_layer.forward(pose_batch.to(device), cur_shape, tex_param, rot_batch.to(device),
+            params['trans'][fid].to(device), handle_collision=False, no_tex=False)
+
+    elif use_arm:
+        hand_verts, hand_joints, ret_dict = mano_layer(betas=params['shape'].repeat([batch_size, 1]).to(device), 
+            global_orient=rot_batch.to(device), transl=params['trans'][fid].to(device), right_hand_pose=pose_batch.to(device), 
+            right_wrist_pose=params['wrist_pose'][fid].to(device),
+            return_type='mano_w_arm')
+        # ret_dict['T'].shape: [batch_size, V, 4, 4]
+        # ret_dict['W'].shape: [batch_size, V, J]
+    else:
+        hand_verts, hand_joints = mano_layer(torch.cat((rot_batch, pose_batch), 1).to(device),
+                params['shape'].repeat([batch_size, 1]).to(device),
+                params['trans'][fid].to(device))
+    hand_verts = hand_verts / 1000.0 # in meter
+    hand_joints = hand_joints / 1000.0
+    faces = params['mesh_faces'].repeat(batch_size, 1, 1)
+
+    if params['verts_disps'] is not None:
+        mesh_mano = Meshes(hand_verts.to(device), faces.to(device))
+        if mesh_subdivider is not None:
+            mesh = mesh_subdivider(mesh_mano)
+            # NOTE: cannot call subdivide_homogeneous(mesh_mano) directly, _N will be set to 1 instead of len(mesh)
+            # mesh._compute_vertex_normals()
+            if use_arm:
+                new_verts = mesh.verts_packed()
+                old_verts = mesh_mano.verts_packed()
+
+                # 计算所有新顶点与旧顶点之间的距离
+                distances = torch.norm(new_verts[:, None, :] - old_verts[None, :, :], dim=2)
+
+                # 获取最接近的三个顶点的索引
+                _, closest_idxs = distances.topk(3, largest=False)
+
+                weights = 1.0 / (distances.gather(1, closest_idxs) + 1e-8)
+                weights = weights / weights.sum(dim=1, keepdim=True)
+                
+                # 使用gather方法取得最接近的顶点矩阵
+                closest_matrices = ret_dict['T'][0, closest_idxs]
+
+                # 插值新的4x4矩阵
+                ret_dict['T'] = torch.sum(closest_matrices * weights[:, :, None, None], dim=1).unsqueeze(0)
+                
+        else:
+            mesh = mesh_mano
+        # Displacement along normal
+        if params['verts_disps'].shape[1] == 1:
+            verts_offset = (mesh.verts_normals_padded() * params['verts_disps'].repeat(batch_size, 1, 1))
+        # Displacement in any direction
+        else:
+            verts_offset = params['verts_disps'].repeat(batch_size, 1, 1)
+
+        hand_verts = mesh.verts_padded() + verts_offset
+        faces = mesh.faces_padded()
+
+        ret_dict['verts_offset']= verts_offset
+
+    if verts_textures:
+        if vis_normal:
+            mesh = Meshes(hand_verts.to(device), faces.to(device))
+            verts_normal = mesh.verts_normals_padded()
+            verts_color = (verts_normal + 1.0) / 2.0
+        else:
+            verts_color = params['verts_rgb']
+        textures = TexturesVertex(verts_features=verts_color.repeat(batch_size, 1, 1).float())
+        mesh = Meshes(hand_verts.to(device), faces.to(device), textures.to(device))
+    else:
+        if configs['model_type'] == 'nimble':
+            uv_map = tex_img[..., [2,1,0]]
+            params['normal_map'] = tex_img[..., [6,5,4]].detach()
+        elif shared_texture:
+            uv_map = params['texture'][None, 0].repeat(batch_size, 1, 1, 1).to(device)
+        else:
+            uv_map = params['texture'].to(device)
+        textures = TexturesUV(maps=uv_map,
+                                faces_uvs=params['faces_uvs'].repeat(batch_size, 1, 1).type(torch.long).to(device),
+                                verts_uvs=params['verts_uvs'].repeat(batch_size, 1, 1).to(device))
+        mesh = Meshes(hand_verts.to(device), faces.to(device), textures.to(device))
+    for key in ret_dict.keys():
+        ret_dict[key] = ret_dict[key].to(device)
+    
+    return hand_joints.to(device), hand_verts.to(device), faces.to(device), textures.to(device), ret_dict # mesh
+
 
 def prepare_materials(params, batch_size, shared_texture=True, device='cuda'):
     if 'normal_map' in params:

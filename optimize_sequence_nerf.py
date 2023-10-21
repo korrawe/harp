@@ -18,7 +18,7 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import renderer.renderer_helper as renderer_helper
-from pytorch3d.structures import Meshes
+from pytorch3d.structures import Meshes,Pointclouds
 from pytorch3d.io import save_obj
 from pytorch3d.ops import SubdivideMeshes, taubin_smoothing
 from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
@@ -30,7 +30,7 @@ from loss.texture_reg import albedo_reg, normal_reg
 
 from utils.data_util import load_multiple_sequences
 from utils.eval_util import image_eval, load_gt_vert, align_w_scale
-from utils.visualize import render_360, concat_image_in_dir, render_360_light, render_image, prepare_mesh, prepare_materials, render_image_with_RT
+from utils.visualize import render_360, concat_image_in_dir, render_360_light, render_image, prepare_mesh, prepare_materials, render_image_with_RT,prepare_mesh_NeRF
 from utils import file_utils, hand_model_utils, config_utils
 
 import trimesh
@@ -41,10 +41,13 @@ sys.path.append('DS_NeRF')
 
 from DS_NeRF.run_nerf_helpers import *
 from DS_NeRF.run_nerf import *
+from pytorch3d.loss import point_mesh_face_distance
 
 
 # from DS_NeRF.run_nerf import config_parser
 
+import point_mesh_distance_modified
+import igl
 
 
 
@@ -80,7 +83,7 @@ def show_img_pair(ypred_np, ytrue_np, step=-1, silhouette=False, save_img_dir=No
 
 def get_mesh_subdivider(hand_layer, use_arm=False, device='cuda'):
     if use_arm:
-        hand_verts, arm_joints = hand_layer(betas=torch.zeros([1, 10]).to(device), global_orient=torch.zeros([1, 3]).to(device),
+        hand_verts, arm_joints, _ = hand_layer(betas=torch.zeros([1, 10]).to(device), global_orient=torch.zeros([1, 3]).to(device),
             transl=torch.zeros([1, 3]).to(device), right_hand_pose=torch.zeros([1, 45]).to(device), return_type='mano_w_arm')
         faces = hand_layer.right_arm_faces_tensor
     else:
@@ -404,7 +407,6 @@ def debug_ray_point_and_mesh(params,hand_layer,configs,mesh_subdivider):
     temp_near, temp_far = geometry_guided_near_far_torch(rays_o, rays_d, hand_verts.squeeze(),geo_threshold=0.1)
     hit_mask=temp_near < temp_far
 
-    
     temp_near[hit_mask] = temp_near[hit_mask]
     temp_far[hit_mask] = temp_far[hit_mask]
     rays_o = rays_o[hit_mask]
@@ -435,6 +437,98 @@ def debug_ray_point_and_mesh(params,hand_layer,configs,mesh_subdivider):
     point_cloud.export('colored_points.ply')
 
 
+def warp_samples_to_canonical_diff(pts_np,verts_np,faces_np, T):
+    # f_id, unsigned_squared_dist=point_mesh_distance_modified.point_mesh_face_distance(pcl, meshes)
+    signed_dist, f_id, closest = igl.signed_distance(pts_np, verts_np, faces_np[:, :3])
+    # differentiable barycentric interpolation
+
+    closest_face_np = faces_np[:, :3][f_id]
+    closest_face_device_T=torch.from_numpy(closest_face_np).to(T.device) # (N, 3)
+
+    closest_tri = verts_np[closest_face_np]
+    closest_tri=torch.from_numpy(closest_tri).float().to(T.device)
+    closest = torch.from_numpy(closest).float().to(T.device)
+    v0v1 = closest_tri[:, 1] - closest_tri[:, 0]
+    v0v2 = closest_tri[:, 2] - closest_tri[:, 0]
+    v1v2 = closest_tri[:, 2] - closest_tri[:, 1]
+    v2v0 = closest_tri[:, 0] - closest_tri[:, 2]
+    v1p = closest - closest_tri[:, 1]
+    v2p = closest - closest_tri[:, 2]
+    N = torch.cross(v0v1, v0v2)
+    denom = torch.bmm(N.unsqueeze(dim=1), N.unsqueeze(dim=2)).squeeze()
+    C1 = torch.cross(v1v2, v1p)
+    u = torch.bmm(N.unsqueeze(dim=1), C1.unsqueeze(dim=2)).squeeze() / denom
+    C2 = torch.cross(v2v0, v2p)
+    v = torch.bmm(N.unsqueeze(dim=1), C2.unsqueeze(dim=2)).squeeze() / denom
+    w = 1 - u - v
+    barycentric = torch.stack([u, v, w], dim=1) # (N, 3)
+    T_interp = (T[closest_face_device_T] * barycentric[..., None, None]).sum(axis=1)
+    T_interp_inv = torch.inverse(T_interp)
+    return T_interp_inv, torch.from_numpy(f_id), torch.from_numpy(signed_dist)
+
+def pts_w2canonical(pts,verts,faces,pts_np,verts_np,faces_np,hand_dict):
+    """ Transform pts from world to canonical space
+    pts:(batch_size, N, 3)
+    hand_dict: return by prepare_mesh_NeRF, with 
+    'T':[batch_size, V, 4, 4],'W': [batch_size, V, J], 'transl': [batch_size, 3],
+    'verts_offset':[batch_size, V, 3], 'joints_wrist':[batch_size, 3]"""
+    assert len(pts.shape)==3, "pts should be (batch_size, N, 3),got {}".format(pts.shape)
+
+    # warp_samples_to_canonical_diff
+    T_interp_inv, f_id, signed_dist=warp_samples_to_canonical_diff(pts_np,verts_np,faces_np, hand_dict['T'].squeeze(0))
+
+    T_interp_inv=T_interp_inv.to(pts.device) # (N, 4, 4)
+    f_id=f_id.to(pts.device) # (N,)
+    signed_dist=signed_dist.to(pts.device) # (N,)
+
+    # 1. minus transl, please refer to hand_models/smplx/smplx/body_models.py: SMPLXARM_NeRF
+    pts=pts-hand_dict['transl'][:,None,:]
+
+    # 2. plus joints, after this pts are relative to template hand in world space
+    pts=pts+hand_dict['joints_wrist'][:,None,:]
+
+    # 3. transform pts to canonical space using T_interp_inv using einsum
+    pts_canonical=torch.einsum('bij,bnj->bni',T_interp_inv,pts)
+
+    return pts_canonical
+
+def test_pts_w2canonical(verts,faces,verts_np,faces_np,hand_dict):
+    pts=verts.clone().detach()
+    pts_np=verts_np.copy()
+    # warp_samples_to_canonical_diff
+    T_interp_inv, f_id, signed_dist=warp_samples_to_canonical_diff(pts_np,verts_np,faces_np, hand_dict['T'].squeeze(0))
+
+    T_interp_inv=T_interp_inv.to(pts.device) # (N, 4, 4)
+    f_id=f_id.to(pts.device) # (N,)
+    signed_dist=signed_dist.to(pts.device) # (N,)
+
+    # 1. minus transl, please refer to hand_models/smplx/smplx/body_models.py: SMPLXARM_NeRF
+    pts=pts-hand_dict['transl'][:,None,:]
+
+    # 2. plus joints, after this pts are relative to template hand in world space
+    pts=pts+hand_dict['joints_wrist'][:,None,:]
+
+    # 3. transform pts to canonical space using T_interp_inv using einsum
+    pts_canonical=torch.einsum('nij,bnj->bni',T_interp_inv[:,:3,:3],pts) +  T_interp_inv[:,:3,3]# (batch_size, N, 3)
+
+    # convert to numpy and save (assume batch_size=1)
+    pts_canonical_np=pts_canonical.detach().squeeze(0).cpu().numpy()
+    verts_canonical_np=hand_dict['v_shaped'].detach().squeeze(0).cpu().numpy()
+
+    # 聚合所有的点
+    all_points = np.concatenate([pts_canonical_np, verts_canonical_np], axis=0)
+
+    # 设定颜色：蓝色用于 pts，红色用于 mesh_pts
+    pts_colors = np.tile(np.array([[0.0, 0.0, 1.0]]), (pts_canonical_np.shape[0], 1))
+    mesh_colors = np.tile(np.array([[1.0, 0.0, 0.0]]), (verts_canonical_np.shape[0], 1))
+
+    all_colors = np.concatenate([pts_colors, mesh_colors], axis=0)
+
+    point_cloud = trimesh.points.PointCloud(vertices=all_points, colors=all_colors)
+
+    point_cloud.export('canonical_points.ply')
+
+    print('finished test with canonical_points.ply')
 
 
 def optimize_hand_sequence(configs, input_params, images_dataset, val_params, val_images_dataset,
@@ -523,8 +617,8 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
     
     #### End initialization ####
 
-    batch_size = 18 # 19 # 10 # 30 # 2 # 16
-    val_batch = 9
+    batch_size = 1 # 19 # 10 # 30 # 2 # 16
+    val_batch = 1
     
     images_dataloader = DataLoader(images_dataset, batch_size=batch_size, shuffle=True, num_workers=20)
     val_images_dataloader = DataLoader(val_images_dataset, batch_size=val_batch, shuffle=True, num_workers=20)  # Shuffle val
@@ -552,10 +646,10 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
          }
 
     args=configs['nerf_args']
-    # render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf_tcnn(
-    #         args)   
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf_tcnn(
+            args)   
 
-    debug_ray_point_and_mesh(params,hand_layer,configs,mesh_subdivider)
+    # debug_ray_point_and_mesh(params,hand_layer,configs,mesh_subdivider)
     H=W=configs['img_size']
 
     
@@ -564,7 +658,7 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
 
     with torch.no_grad():
         # NOTE: The reference mesh is from the first step, it should be the mesh with mean pose instead
-        hand_joints, hand_verts, faces, textures = prepare_mesh(params, torch.tensor([fid]), hand_layer, use_verts_textures, mesh_subdivider, 
+        hand_joints, hand_verts, faces, textures, _ = prepare_mesh_NeRF(params, torch.tensor([fid]), hand_layer, use_verts_textures, mesh_subdivider, 
         global_pose=GLOBAL_POSE, configs=configs, shared_texture=SHARED_TEXTURE, use_arm=configs['use_arm'], device=device)
         ref_meshes = Meshes(hand_verts, faces, textures)
 
@@ -592,7 +686,7 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                 light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, device=device)
 
             # Meshes
-            hand_joints, hand_verts, faces, textures = prepare_mesh(params, fid, hand_layer, use_verts_textures, mesh_subdivider,
+            hand_joints, hand_verts, faces, textures, hand_dict = prepare_mesh_NeRF(params, fid, hand_layer, use_verts_textures, mesh_subdivider,
                 global_pose=GLOBAL_POSE, configs=configs, shared_texture=SHARED_TEXTURE, device=device, use_arm=configs['use_arm'])
             meshes = Meshes(hand_verts, faces, textures)
             cam = params['cam'][fid]
@@ -605,16 +699,55 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
             coords = torch.stack(torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
                                         -1)  # (H, W, 2)
             coords = torch.reshape(coords, [-1, 2]) 
-            rays_o, rays_d = get_rays(H, W, configs['focal_length'], params['w2c'][fid])
+            rays_o, rays_d = get_rays(H, W, configs['focal_length'], params['w2c'][fid].squeeze())
             rays_o_reshape = rays_o.reshape(-1, 3)
             rays_d_reshape = rays_d.reshape(-1, 3)
             near, far = geometry_guided_near_far_torch(rays_o_reshape, rays_d_reshape, hand_verts.squeeze(),geo_threshold=0.1)
             hit_mask=near < far
             near[hit_mask] = near[hit_mask]
             far[hit_mask] = far[hit_mask]
+            rays_o_reshape = rays_o_reshape[hit_mask]
+            rays_d_reshape = rays_d_reshape[hit_mask]
             # reshape hit_mask into (H, W)
             hit_mask = hit_mask.reshape(H, W)
 
+            # choose args.N_rand rays using randperm
+            rand_idx = torch.randperm(rays_o_reshape.shape[0])[:args.N_rand]
+            rays_o_reshape = rays_o_reshape[rand_idx]
+            rays_d_reshape = rays_d_reshape[rand_idx]
+            near = near[rand_idx]
+            far = far[rand_idx]
+            # get points between near and far with args.N_samples intervals
+            t_vals = torch.linspace(0., 1., steps=args.N_samples, device=device)
+            # expand
+            z_vals = near[..., None] * (1. - t_vals[None, ...]) + far[..., None] * (t_vals[None, ...]) # (N_rays, N_samples)
+
+            if args.perturb > 0.:
+                # get intervals between samples
+                mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+                upper = torch.cat([mids, z_vals[..., -1:]], -1)
+                lower = torch.cat([z_vals[..., :1], mids], -1)
+                # stratified samples in those intervals
+                t_rand = torch.rand(z_vals.shape).to(device)
+
+            pts = rays_o_reshape[..., None, :] + rays_d_reshape[..., None, :] * z_vals[..., :, None] # (N_rays, N_samples, 3)
+
+            pts=pts.reshape(1,-1,3)
+            pts_np=pts.reshape(-1,3).detach().cpu().numpy()
+            verts_np=hand_verts.reshape(-1,3).detach().cpu().numpy()
+            faces_np=faces.detach().cpu().numpy().squeeze(0)
+
+            test_pts_w2canonical(hand_verts,faces,verts_np,faces_np,hand_dict)
+            pts_w2canonical(pts,hand_verts,faces,pts_np,verts_np,faces_np,hand_dict)
+
+            all_ret=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals, **render_kwargs_train)
+
+
+            k_extract = ['rgb_map', 'disp_map', 'acc_map', 'depth_map']
+            ret_list = [all_ret[k] for k in k_extract]
+            ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
+
+            rgb, disp, acc, depth, extras = ret_list+ [ret_dict]
 
 
             # Shihouette
@@ -833,7 +966,7 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                 light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, device=device)
 
             # Meshes
-            hand_joints, hand_verts, faces, textures = prepare_mesh(params, fid, hand_layer, use_verts_textures, mesh_subdivider,
+            hand_joints, hand_verts, faces, textures = prepare_mesh_NeRF(params, fid, hand_layer, use_verts_textures, mesh_subdivider,
                 global_pose=GLOBAL_POSE, configs=configs, shared_texture=SHARED_TEXTURE, use_arm=configs['use_arm'], device=device)
             # Material properties
             materials_properties = prepare_materials(params, fid.shape[0])
@@ -1172,7 +1305,7 @@ def main():
     # Get config
     config_dict = config_utils.get_config()
     config_dict["device"] = 'cuda' 
-    hand_layer, VERTS_UVS, FACES_UVS, VERTS_COLOR = hand_model_utils.load_hand_model(config_dict)
+    hand_layer, VERTS_UVS, FACES_UVS, VERTS_COLOR = hand_model_utils.load_hand_model_NeRF(config_dict)
     # Load data
     # Mask in the same dir as image with format "%04d.jpg" for image, "%04d_mask.jpg" for mask
     (mano_params, images_dataset,
