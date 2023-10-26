@@ -8,7 +8,9 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 
 
-def load_img(img_path, torch_tensor=False, downsample_factor=1, load_mask=False, erode=False):
+def load_img(img_path, torch_tensor=False, downsample_factor=1, load_mask=False, erode=False, dilate=False):
+
+    assert not (erode and dilate), "Cannot erode and dilate at the same time"
     
     if load_mask:
         img = np.asarray(Image.open(img_path).convert('L')) / 255
@@ -17,7 +19,12 @@ def load_img(img_path, torch_tensor=False, downsample_factor=1, load_mask=False,
         # Erode mask
         if erode:
             kernel = np.ones((3,3), np.uint8)
-            img = cv2.erode(img, kernel, iterations=2)
+            img = cv2.dilate(img, kernel, iterations=3)
+        
+        if dilate:
+            kernel = np.ones((3,3), np.uint8)
+            img = cv2.dilate(img, kernel, iterations=2)
+
 
     else:
         img = np.asarray(Image.open(img_path).convert('RGB')) / 255
@@ -47,8 +54,9 @@ class ImagesDataset(Dataset):
         col_img = load_img(self.image_paths[fid], downsample_factor=self.downsample_factor, torch_tensor=True)
         mask_img = load_img(self.mask_paths[fid], downsample_factor=self.downsample_factor, torch_tensor=True, load_mask=True)
         mask_img_eroded = load_img(self.mask_paths[fid], downsample_factor=self.downsample_factor, torch_tensor=True, load_mask=True, erode=True)
+        mask_img_dilated = load_img(self.mask_paths[fid], downsample_factor=self.downsample_factor, torch_tensor=True, load_mask=True, dilate=True)
         # mask_img_eroded = load_img(self.mask_paths[fid], downsample_factor=2, torch_tensor=True, load_mask=True, erode=True)
-        return fid, col_img, mask_img, mask_img_eroded
+        return fid, col_img, mask_img, mask_img_eroded, mask_img_dilated
 
 
 def combine_dict_to_batch(mano_dict):

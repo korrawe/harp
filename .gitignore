@@ -146,3 +146,7 @@ detectron2_repo
 /htmlpth/
 /hand_models/
 /mano/models/
+
+
+*.ply
+*.png

@@ -88,6 +88,7 @@ def prepare_mesh(params, fid, mano_layer, verts_textures, mesh_subdivider, globa
         mesh = Meshes(hand_verts.to(device), faces.to(device), textures.to(device))
     return hand_joints.to(device), hand_verts.to(device), faces.to(device), textures.to(device) # mesh
 
+@torch.no_grad()
 def prepare_mesh_NeRF(params, fid, mano_layer, verts_textures, mesh_subdivider, global_pose, configs, device='cuda', 
         vis_normal=False, shared_texture=True, use_arm=False):
     """Return mesh with texture and material properties in world coordinates."""

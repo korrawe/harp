@@ -1,5 +1,6 @@
 from json import dump
 import os
+from typing import Any
 import yaml
 import shutil
 from matplotlib import image
@@ -43,11 +44,14 @@ from DS_NeRF.run_nerf_helpers import *
 from DS_NeRF.run_nerf import *
 from pytorch3d.loss import point_mesh_face_distance
 
+import lpips
+
 
 # from DS_NeRF.run_nerf import config_parser
 
 import point_mesh_distance_modified
 import igl
+import wandb
 
 
 
@@ -326,15 +330,16 @@ def get_optimizers(params, configs):
     sched_coarse = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_coarse, patience=40, verbose=True) # 30 is also good
     return opt_coarse, opt_app, sched_coarse
 
+@torch.no_grad()
 def params_cam2transform(params,configs,device='cuda'):
     """given params,return transform from world to camera"""
     # X_cam = X_world R + T
     cams=params['cam'] # might be list
     focal_length=configs['focal_length']
     img_size=configs['img_size']
-    camera_t = torch.stack([-cams[:, 1], -cams[:, 2], 2 * focal_length/(img_size * cams[:, 0] +1e-9)], dim=1).to(device)
-    R_batch = torch.Tensor([[-1., 0., 0.], [0., -1., 0.], [0., 0., 1.]]).repeat(camera_t.shape[0], 1, 1).to(device)
-    # combine rotation and translation into transformation matrix (B,4,4)
+    camera_t = torch.stack([cams[:, 1], cams[:, 2], 2 * focal_length/(img_size * cams[:, 0] +1e-9)], dim=1).to(device)
+    R_batch = torch.Tensor([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]).repeat(camera_t.shape[0], 1, 1).to(device)
+    # combine rotation and translation into transformation matrix (B,4,4) 
     transform = torch.eye(4).unsqueeze(0).repeat(camera_t.shape[0], 1, 1).to(device)
     transform[:, :3, :3] = R_batch
     transform[:, :3, 3] = camera_t
@@ -361,6 +366,7 @@ def get_rays(H, W, focal, c2w=None,device='cuda'):
     rays_o = c2w[:3, -1].expand(rays_d.shape)
     return rays_o, rays_d 
 
+@torch.no_grad()
 def geometry_guided_near_far_torch(orig, dir, vert, geo_threshold=0.01):
     """Compute near and far for each ray"""
     num_vert = vert.shape[0]
@@ -379,6 +385,25 @@ def geometry_guided_near_far_torch(orig, dir, vert, geo_threshold=0.01):
     far = far.max(dim=1)[0]
     return near, far # shape (num_rays,)
 
+@torch.no_grad()
+def geometry_guided_near_far_torch_dummy(orig, dir, vert, geo_threshold=0.01):
+    """Compute near and far for each ray"""
+    num_vert = vert.shape[0]
+    num_rays = orig.shape[0]
+    # 计算orig和vert的距离
+    dist=((orig[:1]-vert)**2).sum(dim=-1).sqrt() # shape (num_vert,)
+    min_dist=dist.min() # shape (1,)
+    max_dist=dist.max() # shape (1,)
+    near=min_dist-geo_threshold
+    far=max_dist+geo_threshold
+
+    # expand
+    near=near.expand(num_rays)
+    far=far.expand(num_rays)
+
+
+    return near, far # shape (num_rays,)
+
 
 @torch.no_grad()
 def debug_ray_point_and_mesh(params,hand_layer,configs,mesh_subdivider):
@@ -389,7 +414,7 @@ def debug_ray_point_and_mesh(params,hand_layer,configs,mesh_subdivider):
     device=params['w2c'].device
     with torch.no_grad():
     # NOTE: The reference mesh is from the first step, it should be the mesh with mean pose instead
-        hand_joints, hand_verts, faces, textures = prepare_mesh(params, torch.tensor([20]), hand_layer, use_verts_textures, mesh_subdivider, 
+        hand_joints, hand_verts, faces, textures,_ = prepare_mesh_NeRF(params, torch.tensor([20]), hand_layer, use_verts_textures, mesh_subdivider, 
         global_pose=GLOBAL_POSE, configs=configs, shared_texture=SHARED_TEXTURE, use_arm=configs['use_arm'], device=device)
         ref_meshes = Meshes(hand_verts, faces, textures)
 
@@ -466,7 +491,7 @@ def warp_samples_to_canonical_diff(pts_np,verts_np,faces_np, T):
     T_interp_inv = torch.inverse(T_interp)
     return T_interp_inv, torch.from_numpy(f_id), torch.from_numpy(signed_dist)
 
-def pts_w2canonical(pts,verts,faces,pts_np,verts_np,faces_np,hand_dict):
+def pts_w2canonical(pts,verts,faces,pts_np,verts_np,faces_np,hand_dict,return_dict=False):
     """ Transform pts from world to canonical space
     pts:(batch_size, N, 3)
     hand_dict: return by prepare_mesh_NeRF, with 
@@ -488,13 +513,62 @@ def pts_w2canonical(pts,verts,faces,pts_np,verts_np,faces_np,hand_dict):
     pts=pts+hand_dict['joints_wrist'][:,None,:]
 
     # 3. transform pts to canonical space using T_interp_inv using einsum
-    pts_canonical=torch.einsum('bij,bnj->bni',T_interp_inv,pts)
+    pts_canonical=torch.einsum('nij,bnj->bni',T_interp_inv[:,:3,:3],pts) + T_interp_inv[:,:3,3]# (batch_size, N, 3)
 
-    return pts_canonical
+    if not return_dict:
+        return pts_canonical
+    else:
+        ret_dict={}
+        ret_dict['signed_dist']=signed_dist
+        return pts_canonical,ret_dict
+
+class CoordinateTransformer:
+    def __init__(self, reference_points, scale):
+        self.offset = -reference_points.mean(0)
+        cetered_points = reference_points + self.offset
+        cetered_points=cetered_points[cetered_points[:,0]<0]
+        self.scale_factor = scale / (cetered_points).abs().max()
+    
+    def __call__(self, points, clamp=True):
+        # 应用坐标转换
+        transformed_points = (points+ self.offset) * self.scale_factor 
+        
+        # 将结果限制在 [-1, 1] 范围内
+        if clamp: transformed_points = torch.clamp(transformed_points, -1, 1)
+        
+        return transformed_points
+
+    
+def save_points(points1,points2,save_path):
+    """save points1 and points2 to save_path"""
+    # point1, point2最多取50000个点
+    if points1.shape[0] > 50000:
+        idx = np.random.choice(points1.shape[0], 50000, replace=False)
+        points1 = points1[idx]
+    if points2.shape[0] > 50000:
+        idx = np.random.choice(points2.shape[0], 50000, replace=False)
+        points2 = points2[idx]
+    # 聚合所有的点
+    all_points = np.concatenate([points1, points2], axis=0)
+
+    # 设定颜色：蓝色用于 pts，红色用于 mesh_pts
+    point1_colors = np.tile(np.array([[0.0, 0.0, 1.0]]), (points1.shape[0], 1))
+    point2_colors = np.tile(np.array([[1.0, 0.0, 0.0]]), (points2.shape[0], 1))
+
+    all_colors = np.concatenate([point1_colors, point2_colors], axis=0)
+
+    point_cloud = trimesh.points.PointCloud(vertices=all_points, colors=all_colors)
+
+    if not save_path.endswith('.ply'):
+        save_path+='.ply'
+
+    point_cloud.export(save_path)
+
 
 def test_pts_w2canonical(verts,faces,verts_np,faces_np,hand_dict):
     pts=verts.clone().detach()
-    pts_np=verts_np.copy()
+    pts=pts+torch.randn_like(pts)*0.005
+    pts_np=pts.detach().cpu().squeeze(0).numpy()
     # warp_samples_to_canonical_diff
     T_interp_inv, f_id, signed_dist=warp_samples_to_canonical_diff(pts_np,verts_np,faces_np, hand_dict['T'].squeeze(0))
 
@@ -509,7 +583,7 @@ def test_pts_w2canonical(verts,faces,verts_np,faces_np,hand_dict):
     pts=pts+hand_dict['joints_wrist'][:,None,:]
 
     # 3. transform pts to canonical space using T_interp_inv using einsum
-    pts_canonical=torch.einsum('nij,bnj->bni',T_interp_inv[:,:3,:3],pts) +  T_interp_inv[:,:3,3]# (batch_size, N, 3)
+    pts_canonical=torch.einsum('nij,bnj->bni',T_interp_inv[:,:3,:3],pts) + T_interp_inv[:,:3,3]# (batch_size, N, 3)
 
     # convert to numpy and save (assume batch_size=1)
     pts_canonical_np=pts_canonical.detach().squeeze(0).cpu().numpy()
@@ -531,11 +605,152 @@ def test_pts_w2canonical(verts,faces,verts_np,faces_np,hand_dict):
     print('finished test with canonical_points.ply')
 
 
+def sample_patch(mask, patch_size):
+    H, W = mask.shape
+    patch_mask = torch.zeros_like(mask, dtype=torch.bool, device=mask.device)
+    
+    # 计算可以作为中心点的坐标的有效范围
+    y, x = torch.where(mask)
+    valid_idx = torch.where((y >= patch_size // 2) & (y <= H - (patch_size + 1) // 2) & 
+                            (x >= patch_size // 2) & (x <= W - (patch_size + 1) // 2))[0]
+    
+    if valid_idx.numel() == 0:
+        # 如果没有有效的中心点，所有不靠近边缘的点都可以作为中心点
+        y, x= torch.where(torch.ones_like(mask))
+        valid_idx = torch.where((y >= patch_size // 2) & (y <= H - (patch_size + 1) // 2) & 
+                                (x >= patch_size // 2) & (x <= W - (patch_size + 1) // 2))[0]
+    
+    # 随机选择一个中心点
+    idx = valid_idx[torch.randint(0, valid_idx.numel(), (1,)).item()]
+    center_y, center_x = y[idx].item(), x[idx].item()
+    
+    # 标记patch_mask中对应的区域
+    patch_mask[center_y - patch_size // 2:center_y + (patch_size + 1) // 2,
+               center_x - patch_size // 2:center_x + (patch_size + 1) // 2] = True
+    
+    return patch_mask
+
+
+def render_whole_image(args,params,H,W,configs,
+                       hand_verts,faces,fid,
+                       render_kwargs,hand_dict,
+                       canonical_coor_normalizer,hand_joints,initial_mask,
+                       device='cuda'):
+    coords = torch.stack(torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
+                                -1)  # (H, W, 2)
+    coords = torch.reshape(coords, [-1, 2]) 
+    rays_o, rays_d = get_rays(H, W, configs['focal_length'], torch.linalg.inv(params['w2c'][fid].squeeze()))
+    rays_o_reshape = rays_o.reshape(-1, 3)
+    rays_d_reshape = rays_d.reshape(-1, 3)
+    hit_mask=initial_mask.reshape(-1)
+    rays_o_reshape=rays_o_reshape[hit_mask]
+    rays_d_reshape=rays_d_reshape[hit_mask]
+    if False:
+        near, far = geometry_guided_near_far_torch_dummy(rays_o_reshape, 
+                                                        rays_d_reshape/rays_d_reshape.norm(dim=-1,keepdim=True), 
+                                                        hand_joints.squeeze(),geo_threshold=0.01)
+    else:
+        near, far = geometry_guided_near_far_torch(rays_o_reshape, rays_d_reshape/rays_d_reshape.norm(dim=-1,keepdim=True), hand_verts.squeeze(),geo_threshold=0.005)
+    # hit_mask[hit_mask][near>far]=False
+    hit_mask[torch.where(hit_mask)[0][near>far]]=False
+    hit_mask_near_far=near<far
+    near = near[hit_mask_near_far]
+    far = far[hit_mask_near_far]
+    rays_o_reshape = rays_o_reshape[hit_mask_near_far]
+    rays_d_reshape = rays_d_reshape[hit_mask_near_far]
+    if near.shape[0] < 100:
+        raise Exception('too few rays, please check the camera pose')
+    # reshape hit_mask into (H, W)
+    hit_mask = hit_mask.reshape(H, W) 
+
+    # get points between near and far with args.N_samples intervals
+    t_vals = torch.linspace(0., 1., steps=args.N_samples, device=device)
+    # expand
+    z_vals = near[..., None] * (1. - t_vals[None, ...]) + far[..., None] * (t_vals[None, ...]) # (N_rays, N_samples)
+
+    if render_kwargs['perturb'] > 0.:
+        # get intervals between samples
+        mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+        upper = torch.cat([mids, z_vals[..., -1:]], -1)
+        lower = torch.cat([z_vals[..., :1], mids], -1)
+        # stratified samples in those intervals
+        t_rand = torch.rand(z_vals.shape).to(device)
+        z_vals = lower + (upper - lower) * t_rand
+
+
+    pts = rays_o_reshape[..., None, :] + rays_d_reshape[..., None, :] * z_vals[..., :, None] # (N_rays, N_samples, 3)
+
+    pts=pts.reshape(1,-1,3)
+    pts_np=pts.reshape(-1,3).detach().cpu().numpy()
+    verts_np=hand_verts.reshape(-1,3).detach().cpu().numpy()
+    faces_np=faces.detach().cpu().numpy().squeeze(0)
+
+    # test_pts_w2canonical(hand_verts,faces,verts_np,faces_np,hand_dict)
+    pts=pts_w2canonical(pts,hand_verts,faces,pts_np,verts_np,faces_np,hand_dict)
+    pts=canonical_coor_normalizer(pts)
+
+    pts=pts.reshape(-1,z_vals.shape[-1],3)
+
+    all_ret_0=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals, **render_kwargs)
+
+    rgb_map_0, disp_map_0, acc_map_0,weights_0 = all_ret_0['rgb_map'], all_ret_0['disp_map'], all_ret_0['acc_map'], all_ret_0['weights']
+    alpha_0=all_ret_0['alpha'] if 'alpha' in all_ret_0 else None
+
+    z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+    z_samples = sample_pdf(
+        z_vals_mid, weights_0[..., 1:-1], args.N_importance, det=(render_kwargs['perturb'] == 0.))
+    z_samples = z_samples.detach()
+
+    z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+    pts = rays_o_reshape[..., None, :] + rays_d_reshape[..., None, :] * z_vals[..., :,
+                                                                None]  # [N_rays, N_samples + N_importance, 3]
+
+    pts=pts.reshape(1,-1,3)
+    pts_np=pts.reshape(-1,3).detach().cpu().numpy()
+
+    # test_pts_w2canonical(hand_verts,faces,verts_np,faces_np,hand_dict)
+    pts=pts_w2canonical(pts,hand_verts,faces,pts_np,verts_np,faces_np,hand_dict)
+    pts=canonical_coor_normalizer(pts)
+
+    pts=pts.reshape(-1,z_vals.shape[-1],3)
+
+    all_ret=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals,fine_stage=True, **render_kwargs)
+
+    rgb_map, disp_map, acc_map, weights = all_ret['rgb_map'], all_ret['disp_map'], all_ret['acc_map'], all_ret['weights']
+
+    rgb_all_0=torch.zeros((H,W,3)).to(device)
+    idx_valid=torch.where(hit_mask)
+    rgb_all_0[idx_valid]=rgb_map_0.reshape(-1,3)
+    rgb_all=torch.zeros((H,W,3)).to(device)
+    rgb_all[idx_valid]=rgb_map.reshape(-1,3)
+    print(f'hit_mask.sum():{hit_mask.sum()}')
+    print(f'idx_valid.sum():{idx_valid[0].reshape(-1).shape[0]+idx_valid[1].reshape(-1).shape[0]}')
+    print(f'rgb_all_0.max():{rgb_all_0.max()}')
+    print(f'rgb_all.max():{rgb_all.max()}')
+    if rgb_all_0.max()<0.3:
+        raise Exception('rgb_all_0.max()<0.3, wrong for all images,fid:{},got render max:{}'.format(fid,rgb_all_0.max()))
+
+
+    return rgb_all_0,rgb_all
+    
+
+
+
 def optimize_hand_sequence(configs, input_params, images_dataset, val_params, val_images_dataset,
         hand_layer, 
         VERTS_UVS=None, FACES_UVS=None, VERTS_COLOR=None, device='cuda'):
 
-    tf_writer = SummaryWriter(log_dir=configs["base_output_dir"])
+    # tf_writer = SummaryWriter(log_dir=configs["base_output_dir"])
+    DEBUG=False
+    WANDB=True
+    PATCH=True
+    PATCH_SIZE=64
+    if DEBUG:WANDB=False
+    TIME=False
+    HARD_SURFACE_OFFSET=0.31326165795326233
+    SMLP_REG_DUMMY=True
+    if WANDB:
+        wandb.init(project="hand_nerf", config=configs, dir=configs["base_output_dir"])
     # Coarse optimization, including translation, rotation, pose, shape
     COARSE_OPT = True
     # Appearance optimization, including texture, lighting
@@ -625,8 +840,8 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
 
     ### Define loss and optimizer
     l1_loss = torch.nn.L1Loss()
-    # For vgg_loss
-    vgg = Vgg16Features(layers_weights = [1, 1/16, 1/8, 1/4, 1]).to(device)
+    # # For vgg_loss
+    # vgg = Vgg16Features(layers_weights = [1, 1/16, 1/8, 1/4, 1]).to(device)
 
     # Get optimizers
     opt_coarse, opt_app, sched_coarse = get_optimizers(params, configs)
@@ -643,76 +858,205 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
             "vgg" :          {"weight": 1.0, "values": []}, # 1.0  ##
             "albedo" :       {"weight": 0.5, "values": []}, # 0.1 # 1.0 # 0.5 ##
             "normal_reg" :   {"weight": 0.1, "values": []}, # 0.5 ##
+            # NeRF
+            'rgb_0':         {"weight": 1.0, "values": []}, # 1.0 ## 1.0
+            'rgb':         {"weight": 1.0, "values": []}, # 1.0 ## 1.0
+            'acc_0':         {"weight": 0.001, "values": []}, 
+            'acc':         {"weight": 0.001, "values": []},
+            'sparsity_reg':  {"weight": 0.01, "values": []},
+            'sparsity_reg_0':  {"weight": 0.01, "values": []},
+            'smpl_reg':      {"weight": 0.1, "values": []},
+            'smpl_reg_0':      {"weight": 0.1, "values": []},
+            'smpl_reg_dummy':      {"weight": 0.1, "values": []},
+            'smpl_reg_dummy_0':      {"weight": 0.1, "values": []},
+            'lpips':         {"weight": 0.1, "values": []},
+            'lpips_0':         {"weight": 0.1, "values": []},
+
+            # 'acc_0':         {"weight": 0., "values": []}, 
+            # 'acc':         {"weight": 0., "values": []},
+            # 'sparsity_reg':  {"weight": 0., "values": []},
+            # 'sparsity_reg_0':  {"weight": 0., "values": []},
+            # 'smpl_reg':      {"weight": 0., "values": []},
+            # 'smpl_reg_0':      {"weight": 0., "values": []},
+            # 'smpl_reg_dummy':      {"weight": 0., "values": []},
+            # 'smpl_reg_dummy_0':      {"weight": 0., "values": []},
+            # 'lpips':         {"weight": 0., "values": []},
+            # 'lpips_0':         {"weight": 0., "values": []},
          }
+    # torch.autograd.set_detect_anomaly(True)
+
+    lpips_fn=lpips.LPIPS(net='alex').to(device)
+    for param in lpips_fn.parameters():
+        param.requires_grad = False
 
     args=configs['nerf_args']
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf_tcnn(
             args)   
+    
+    # set lr of optimizer to be 0.005
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = 0.005
+
+
+    nerf_scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.9, last_epoch=-1)
 
     # debug_ray_point_and_mesh(params,hand_layer,configs,mesh_subdivider)
     H=W=configs['img_size']
 
     
     # Get reference mesh. Use the mesh from the first frame.
-    (fid, y_true, y_sil_true, _) = images_dataset[0]
+    (fid, y_true, y_sil_true, _, _) = images_dataset[0]
 
     with torch.no_grad():
         # NOTE: The reference mesh is from the first step, it should be the mesh with mean pose instead
-        hand_joints, hand_verts, faces, textures, _ = prepare_mesh_NeRF(params, torch.tensor([fid]), hand_layer, use_verts_textures, mesh_subdivider, 
+        hand_joints, hand_verts, faces, textures, hand_dict = prepare_mesh_NeRF(params, torch.tensor([fid]), hand_layer, use_verts_textures, mesh_subdivider, 
         global_pose=GLOBAL_POSE, configs=configs, shared_texture=SHARED_TEXTURE, use_arm=configs['use_arm'], device=device)
         ref_meshes = Meshes(hand_verts, faces, textures)
+        canonical_coor_normalizer=CoordinateTransformer(hand_dict['v_shaped'].squeeze(),scale=0.8)
+
 
     ### Training Loop ###
     epoch_id = 0
     n_iter = 0
-    for epoch_id in tqdm(range(0, configs["total_epoch"])): # 311 # 1501):  # 201
+    global_step=start
+    epoch_start=start%(len(images_dataloader))
+
+    PATCH_ORIGINAL=PATCH
+    N_rand_original=args.N_rand
+
+    for epoch_id in tqdm(range(epoch_start, configs["total_epoch"]),desc='Epoch:'): # 311 # 1501):  # 201
         frame_count = 0
 
         # print("Epoch: %d" % epoch_id)
         epoch_loss = 0.0
         mini_batch_count = 0
-        for (fid, y_true, y_sil_true, y_sil_true_col) in images_dataloader:
+        # set process bar indicating image_dataloader
+        bar=tqdm(total=len(images_dataloader),desc='Image:')
+        for (fid, y_true, y_sil_true, y_sil_true_ero, y_sil_true_dil) in images_dataloader:
+            bar.update(1)
+            if TIME: t0 = time.time()
             cur_batch_size = fid.shape[0]
             y_sil_true = y_sil_true.squeeze(-1).to(device)
-            y_sil_true_col = y_sil_true_col.squeeze(-1).to(device)
+            y_sil_true_ero = y_sil_true_ero.squeeze(-1).to(device)
+            y_sil_true_dil = y_sil_true_dil.squeeze(-1).to(device)
             y_true = y_true.to(device)
-
+            if TIME:
+                t1 = time.time()
+                print(f't0-t1--preparing data:{t1-t0}')
             # Get new shader with updated light position
             if configs["share_light_position"]:
                 light_positions = params['light_positions'][0].repeat(cur_batch_size, 1)
             else:
                 light_positions = params['light_positions'][fid]
-            phong_renderer, silhouette_renderer, normal_renderer = renderer_helper.get_renderers(image_size=img_size, 
-                light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, device=device)
-
+            # phong_renderer, silhouette_renderer, normal_renderer = renderer_helper.get_renderers(image_size=img_size, 
+            #     light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, device=device)
+            if TIME:
+                t2=time.time()
+                print(f't1-t2--get renderer:{t2-t1}')
             # Meshes
             hand_joints, hand_verts, faces, textures, hand_dict = prepare_mesh_NeRF(params, fid, hand_layer, use_verts_textures, mesh_subdivider,
                 global_pose=GLOBAL_POSE, configs=configs, shared_texture=SHARED_TEXTURE, device=device, use_arm=configs['use_arm'])
             meshes = Meshes(hand_verts, faces, textures)
             cam = params['cam'][fid]
+            if TIME:
+                t3=time.time()
+                print(f't2-t3--prepare mesh:{t3-t2}')
 
             # Material properties
-            materials_properties = prepare_materials(params, fid.shape[0])
+            # materials_properties = prepare_materials(params, fid.shape[0])
+
+            if TIME:
+                t4=time.time()
+                print(f't3-t4--prepare materials:{t4-t3}')
             
             #NOTE:New for hand_nerf: get rays in world frame
 
             coords = torch.stack(torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
                                         -1)  # (H, W, 2)
             coords = torch.reshape(coords, [-1, 2]) 
-            rays_o, rays_d = get_rays(H, W, configs['focal_length'], params['w2c'][fid].squeeze())
+            rays_o, rays_d = get_rays(H, W, configs['focal_length'], torch.linalg.inv(params['w2c'][fid]).squeeze())
             rays_o_reshape = rays_o.reshape(-1, 3)
             rays_d_reshape = rays_d.reshape(-1, 3)
-            near, far = geometry_guided_near_far_torch(rays_o_reshape, rays_d_reshape, hand_verts.squeeze(),geo_threshold=0.1)
-            hit_mask=near < far
-            near[hit_mask] = near[hit_mask]
-            far[hit_mask] = far[hit_mask]
-            rays_o_reshape = rays_o_reshape[hit_mask]
-            rays_d_reshape = rays_d_reshape[hit_mask]
+            if PATCH_ORIGINAL:
+                args.N_rand=N_rand_original
+                PATCH=mini_batch_count%3==0
+            else:
+                PATCH=False
+
+            if TIME:
+                t5=time.time()
+                print(f't4-t5--get rays:{t5-t4}')
+            if True:
+                if not PATCH:
+                    # 当不使用PATCH时，随机sampled的点是扩大后的mask
+                    # use img mask as start
+                    hit_mask=(y_sil_true_dil>0.).reshape(-1)
+                    hit_mask_idx=torch.where((y_sil_true_dil>0.).reshape(-1))[0]
+                    # choose 2*args.N_rand rays using randperm
+                    hit_mask_choose_idx=hit_mask_idx[torch.randperm(hit_mask.sum())[:int(1.5*args.N_rand)]] if not DEBUG else hit_mask_idx[torch.arange(hit_mask.sum())]
+                    hit_mask_choose_mask=torch.zeros_like(hit_mask)
+                    hit_mask_choose_mask[hit_mask_choose_idx]=1
+                    hit_mask=hit_mask*hit_mask_choose_mask # shape (H*W)
+                    rays_o_reshape=rays_o_reshape[hit_mask] # shape (int(1.5*args.N_rand),3)
+                    rays_d_reshape=rays_d_reshape[hit_mask] # shape (int(1.5*args.N_rand),3)
+                    near, far = geometry_guided_near_far_torch(rays_o_reshape, 
+                                                               rays_d_reshape/rays_d_reshape.norm(dim=-1,keepdim=True), 
+                                                               hand_verts.squeeze(),geo_threshold=0.005) 
+                    hit_mask_near_far=(near < far) # shape (int(1.5*args.N_rand))
+                else:
+                    # 当使用PATCH时，随机sample的点是缩小的的mask
+                    args.N_rand=PATCH_SIZE**2
+                    near=torch.ones(1)
+                    while len(near)<args.N_rand:
+                        hit_mask=(y_sil_true_ero>0.).squeeze(0) # shape (H,W)
+                        patch_mask=sample_patch(hit_mask,patch_size=PATCH_SIZE)
+                        hit_mask=patch_mask.reshape(-1)
+                        rays_o_reshape_=rays_o_reshape[hit_mask]
+                        rays_d_reshape_=rays_d_reshape[hit_mask]
+                        near, far = geometry_guided_near_far_torch(rays_o_reshape_, 
+                                                                   rays_d_reshape_/rays_d_reshape_.norm(dim=-1,keepdim=True), 
+                                                                   hand_verts.squeeze(),geo_threshold=0.005)
+                        if len(near)<args.N_rand or (near<far).sum()<1:
+                            continue
+                        near[torch.where(near>far)[0]]=near[near<far].mean()-0.01
+                        far[torch.where(near>far)[0]]=far[near<far].mean()+0.01
+                        hit_mask_near_far=(near < far)
+                    rays_o_reshape = rays_o_reshape_
+                    rays_d_reshape = rays_d_reshape_
+                if TIME:
+                    t6=time.time()
+                    print(f't5-t6--get near far:{t6-t5}')
+                
+            else:
+                near, far = geometry_guided_near_far_torch_dummy(rays_o_reshape, rays_d_reshape, hand_joints.squeeze(),geo_threshold=0.008)
+                hit_mask=(y_sil_true_ero>0.).reshape(-1)
+                hit_mask_near_far=(near < far)
+                if TIME:
+                    t6=time.time()
+                    print(f't5-t6--get near far:{t6-t5}')
+            # near=torch.zeros_like(near)
+            try:
+                near = near[hit_mask_near_far]
+                far = far[hit_mask_near_far]
+                rays_o_reshape = rays_o_reshape[hit_mask_near_far]
+                rays_d_reshape = rays_d_reshape[hit_mask_near_far]
+            except:
+                # report near,far,rays_o_reshape,rays_d_reshape's shape and hit_mask_near_far's shape and sum
+                print('index error')
+                print(f'hit_mask_near_far.shape:{hit_mask_near_far.shape}')
+                print(f'hit_mask_near_far.sum():{hit_mask_near_far.sum()}')
+                print(f'near.shape:{near.shape}')
+                print(f'far.shape:{far.shape}')
+                print(f'rays_o_reshape.shape:{rays_o_reshape.shape}')
+                print(f'rays_d_reshape.shape:{rays_d_reshape.shape}')
+                continue
             # reshape hit_mask into (H, W)
             hit_mask = hit_mask.reshape(H, W)
 
             # choose args.N_rand rays using randperm
-            rand_idx = torch.randperm(rays_o_reshape.shape[0])[:args.N_rand]
+            rand_idx = torch.randperm(rays_o_reshape.shape[0])[:args.N_rand] 
+            if DEBUG or PATCH:
+                rand_idx=torch.arange(rays_o_reshape.shape[0])
             rays_o_reshape = rays_o_reshape[rand_idx]
             rays_d_reshape = rays_d_reshape[rand_idx]
             near = near[rand_idx]
@@ -722,6 +1066,9 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
             # expand
             z_vals = near[..., None] * (1. - t_vals[None, ...]) + far[..., None] * (t_vals[None, ...]) # (N_rays, N_samples)
 
+            if near.shape[0] < 100:
+                raise Exception('too few rays, please check the camera pose')
+
             if args.perturb > 0.:
                 # get intervals between samples
                 mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
@@ -729,6 +1076,7 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                 lower = torch.cat([z_vals[..., :1], mids], -1)
                 # stratified samples in those intervals
                 t_rand = torch.rand(z_vals.shape).to(device)
+                z_vals = lower + (upper - lower) * t_rand
 
             pts = rays_o_reshape[..., None, :] + rays_d_reshape[..., None, :] * z_vals[..., :, None] # (N_rays, N_samples, 3)
 
@@ -737,55 +1085,294 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
             verts_np=hand_verts.reshape(-1,3).detach().cpu().numpy()
             faces_np=faces.detach().cpu().numpy().squeeze(0)
 
-            test_pts_w2canonical(hand_verts,faces,verts_np,faces_np,hand_dict)
-            pts_w2canonical(pts,hand_verts,faces,pts_np,verts_np,faces_np,hand_dict)
+            if TIME:
+                t7=time.time()
+                print(f't6-t7--get pts:{t7-t6}')
 
-            all_ret=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals, **render_kwargs_train)
+            if DEBUG:
+                # 检查世界系下的点和手部顶点是否对齐
+                pts_save=pts.clone().detach().reshape(-1,3).cpu().numpy()
+                pts_save=pts_save
+                hand_verts_save=hand_verts.detach().reshape(-1,3).cpu().numpy()
+                save_points(pts_save,hand_verts_save,'pts_world_vs_handverts_world.ply')
 
-
-            k_extract = ['rgb_map', 'disp_map', 'acc_map', 'depth_map']
-            ret_list = [all_ret[k] for k in k_extract]
-            ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
-
-            rgb, disp, acc, depth, extras = ret_list+ [ret_dict]
-
-
-            # Shihouette
-            # Stop computing and updating silhouette when learning texture model
-            y_sil_pred = render_image(meshes, cam, cur_batch_size, silhouette_renderer, configs['img_size'], configs['focal_length'], silhouette=True)
+            # test_pts_w2canonical(hand_verts,faces,verts_np,faces_np,hand_dict)
+            try:
+                pts,ret_dict_warp=pts_w2canonical(pts,hand_verts,faces,pts_np,verts_np,faces_np,hand_dict,return_dict=True)
+            except:
+                print('pts_w2canonical error')
+                continue
+            signed_dist_0=ret_dict_warp['signed_dist']
             
-            # RGB UV
-            if configs["self_shadow"]:
-                # Render with self-shadow
-                light_R, light_T, cam_R, cam_T = renderer_helper.process_info_for_shadow(cam, light_positions, hand_verts.mean(1), 
-                                                    image_size=configs['img_size'], focal_length=configs['focal_length'])
-                shadow_renderer = renderer_helper.get_shadow_renderers(image_size=img_size, 
-                    light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, 
-                    amb_ratio=nn.Sigmoid()(params['amb_ratio']), device=device)
+            near_min=near.min().item()
+            far_max=far.max().item()
 
-                y_pred = render_image_with_RT(meshes, light_T, light_R, cam_T, cam_R,
-                            cur_batch_size, shadow_renderer, configs['img_size'], configs['focal_length'], silhouette=False, 
-                            materials_properties=materials_properties)
-            else:
-                # Render without self-shadow
-                y_pred = render_image(meshes, cam, cur_batch_size, phong_renderer, configs['img_size'], configs['focal_length'], 
-                                      silhouette=False, materials_properties=materials_properties)
+            if DEBUG:
+                # 检查规范化后的手部顶点和手部顶点是否对齐
+                hand_verts_canonicalize=pts_w2canonical(hand_verts,hand_verts,faces,
+                                                     hand_verts.reshape(-1,3).detach().cpu().numpy(),
+                                                     verts_np,faces_np,hand_dict)
+                hand_verts_canonicalize_save=hand_verts_canonicalize.detach().reshape(-1,3).cpu().numpy()
+                hand_verts_shaped_save=hand_dict['v_shaped'].detach().reshape(-1,3).cpu().numpy()
+                save_points(hand_verts_canonicalize_save,hand_verts_shaped_save,'hand_verts_canonicalize_vs_hand_verts_shaped.ply')
 
-            if LOG_IMGAGE and epoch_id % 10 == 0 and mini_batch_count == 0:
-                # Value range 0 (black) -> 1 (white)
-                # Log silhouette
-                show_img_pair(y_sil_pred.detach().cpu().numpy(), y_sil_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
-                        step=epoch_id, silhouette=True, prefix="")
-                # Log RGB
-                show_img_pair(y_pred.detach().cpu().numpy(), y_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
-                        step=epoch_id, silhouette=False, prefix="")
-                # Loss visulization
-                loss_image = torch.abs(y_true * y_sil_true_col.unsqueeze(-1) - y_pred * y_sil_true_col.unsqueeze(-1))
-                show_img_pair(loss_image.detach().cpu().numpy(), y_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
-                        step=epoch_id, silhouette=False, prefix="loss_")
-            mini_batch_count += 1
+            if DEBUG:
+                # 检查规范化后的点和规范化前的点是否对齐
+                pts_save=pts.clone().detach().reshape(-1,3).cpu().numpy()
+                pts_save=pts_save
+                pts_save_before_canonical_normalize=pts_save.copy()
+                hand_verts_save=hand_dict['v_shaped'].detach().reshape(-1,3).cpu().numpy()
+                save_points(pts_save,hand_verts_save,'pts_after_canonical_vs_handverts_shaped.ply')
+                
+            pts=canonical_coor_normalizer(pts)
+
+            if DEBUG:
+                # 检查正则化后的点和规范化后的点是否对齐
+                pts_save=pts.clone().detach().reshape(-1,3).cpu().numpy()
+                pts_save=pts_save
+                hand_verts_save=pts_save_before_canonical_normalize
+                save_points(pts_save,hand_verts_save,'pts_normalized_vs_pts_after_canonical.ply')
+
+            if DEBUG:
+                # 检查正则化后的点和bbox是否对齐
+                hand_verts_shaped_normalize=canonical_coor_normalizer(hand_dict['v_shaped'].detach().reshape(-1,3)).detach().reshape(-1,3).cpu().numpy()
+                # bbox at eight points [-1,-1,-1],[1,-1,-1],[-1,1,-1],[1,1,-1],[-1,-1,1],[1,-1,1],[-1,1,1],[1,1,1]
+                bbox=np.array([[-1,-1,-1],[1,-1,-1],[-1,1,-1],[1,1,-1],[-1,-1,1],[1,-1,1],[-1,1,1],[1,1,1]])
+                save_points(hand_verts_shaped_normalize,bbox,'hand_verts_shaped_normalized_vs_bbox.ply')
+            
+            pts=pts.reshape(args.N_rand,-1,3)
+
+            if TIME:
+                t8=time.time()
+                print(f't7-t8--warp pts:{t8-t7}')
+
+            all_ret_0=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals,retraw=True, **render_kwargs_train)
+
+            if TIME:
+                t9=time.time()
+                print(f't8-t9--first render rays:{t9-t8}')
+            rgb_map_0, disp_map_0, acc_map_0,weights_0 = all_ret_0['rgb_map'], all_ret_0['disp_map'], all_ret_0['acc_map'], all_ret_0['weights']
+            alpha_0=all_ret_0['alpha'] if 'alpha' in all_ret_0 else None
+
+            z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+            z_samples = sample_pdf(
+                z_vals_mid, weights_0[..., 1:-1], args.N_importance, det=(args.perturb == 0.))
+            z_samples = z_samples.detach()
+
+            z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+            pts = rays_o_reshape[..., None, :] + rays_d_reshape[..., None, :] * z_vals[..., :,
+                                                                       None]  # [N_rays, N_samples + N_importance, 3]
+
+            pts=pts.reshape(1,-1,3)
+            pts_np=pts.reshape(-1,3).detach().cpu().numpy()
+            if TIME:
+                t10=time.time()
+                print(f't9-t10--sample pdf:{t10-t9}')
+
+            # test_pts_w2canonical(hand_verts,faces,verts_np,faces_np,hand_dict)
+            pts,ret_dict_warp=pts_w2canonical(pts,hand_verts,faces,pts_np,verts_np,faces_np,hand_dict,return_dict=True)
+            signed_dist=ret_dict_warp['signed_dist']
+            pts=canonical_coor_normalizer(pts)
+
+            pts=pts.reshape(args.N_rand,-1,3)
+            if TIME:
+                t11=time.time()
+                print(f't10-t11--warp pts:{t11-t10}')
+
+            all_ret=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals,retraw=True,fine_stage=True, **render_kwargs_train)
+
+            if TIME:
+                t12=time.time()
+                print(f't11-t12--second render rays:{t12-t11}')
+            y_gt_choose=y_true.squeeze(0)[hit_mask][hit_mask_near_far][rand_idx]
+
+            rgb_map, disp_map, acc_map, weights = all_ret['rgb_map'], all_ret['disp_map'], all_ret['acc_map'], all_ret['weights']
+
+            y_sil_true_choose=y_sil_true.squeeze(0)[hit_mask][hit_mask_near_far][rand_idx]
+
+    
+
+            # # Shihouette
+            # # Stop computing and updating silhouette when learning texture model
+            # y_sil_pred = render_image(meshes, cam, cur_batch_size, silhouette_renderer, configs['img_size'], configs['focal_length'], silhouette=True)
+            
+            # # RGB UV
+            # if configs["self_shadow"]:
+            #     # Render with self-shadow
+            #     light_R, light_T, cam_R, cam_T = renderer_helper.process_info_for_shadow(cam, light_positions, hand_verts.mean(1), 
+            #                                         image_size=configs['img_size'], focal_length=configs['focal_length'])
+            #     shadow_renderer = renderer_helper.get_shadow_renderers(image_size=img_size, 
+            #         light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, 
+            #         amb_ratio=nn.Sigmoid()(params['amb_ratio']), device=device)
+
+            #     y_pred = render_image_with_RT(meshes, light_T, light_R, cam_T, cam_R,
+            #                 cur_batch_size, shadow_renderer, configs['img_size'], configs['focal_length'], silhouette=False, 
+            #                 materials_properties=materials_properties)
+            # else:
+            #     # Render without self-shadow
+            #     y_pred = render_image(meshes, cam, cur_batch_size, phong_renderer, configs['img_size'], configs['focal_length'], 
+            #                           silhouette=False, materials_properties=materials_properties)
+
+            # if LOG_IMGAGE and epoch_id % 10 == 0 and mini_batch_count == 0:
+            #     # Value range 0 (black) -> 1 (white)
+            #     # Log silhouette
+            #     show_img_pair(y_sil_pred.detach().cpu().numpy(), y_sil_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
+            #             step=epoch_id, silhouette=True, prefix="")
+            #     # Log RGB
+            #     show_img_pair(y_pred.detach().cpu().numpy(), y_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
+            #             step=epoch_id, silhouette=False, prefix="")
+            #     # Loss visulization
+            #     loss_image = torch.abs(y_true * y_sil_true_col.unsqueeze(-1) - y_pred * y_sil_true_col.unsqueeze(-1))
+            #     show_img_pair(loss_image.detach().cpu().numpy(), y_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
+            #             step=epoch_id, silhouette=False, prefix="loss_")
+            
 
             loss = {}
+
+            # NOTE:New for hand_nerf: get rgb loss
+            loss_rgb = ((rgb_map-y_gt_choose)**2).mean()
+            loss_rgb_0 = ((rgb_map_0-y_gt_choose)**2).mean()
+            loss['rgb_0'] = loss_rgb_0
+            loss['rgb'] = loss_rgb
+
+            if losses['acc']['weight'] > 0.:
+                loss['acc']=((acc_map-y_sil_true_choose)**2).mean()
+                loss['acc_0']=((acc_map_0-y_sil_true_choose)**2).mean()
+            else:
+                loss['acc']=torch.tensor(0.0, device=device)
+                loss['acc_0']=torch.tensor(0.0, device=device)
+
+            if losses['sparsity_reg']['weight'] > 0.:
+                sparsity_reg = torch.mean(-torch.log(
+                    torch.exp(-torch.abs(acc_map.clamp(0.,1.))) + torch.exp(-torch.abs(1-acc_map.clamp(0.,1.)))
+                + 1e-5) + HARD_SURFACE_OFFSET)
+
+                sparsity_reg=sparsity_reg+torch.mean(-torch.log(
+                    torch.exp(-torch.abs(weights.clamp(0.,1.))) + torch.exp(-torch.abs(1-weights.clamp(0.,1.)))
+                + 1e-5) + HARD_SURFACE_OFFSET)
+
+                loss['sparsity_reg']=sparsity_reg
+
+                sparsity_reg_0=torch.mean(-torch.log(
+                    torch.exp(-torch.abs(acc_map_0.clamp(0.,1.))) + torch.exp(-torch.abs(1-acc_map_0.clamp(0.,1.)))
+                + 1e-5) + HARD_SURFACE_OFFSET)
+
+                sparsity_reg_0=sparsity_reg_0+torch.mean(-torch.log(
+                    torch.exp(-torch.abs(weights_0.clamp(0.,1.))) + torch.exp(-torch.abs(1-weights_0.clamp(0.,1.)))
+                + 1e-5) + HARD_SURFACE_OFFSET)
+
+                loss['sparsity_reg_0']=sparsity_reg_0
+            else:
+                loss['sparsity_reg']=torch.tensor(0.0, device=device)
+                loss['sparsity_reg_0']=torch.tensor(0.0, device=device)
+
+            if losses['smpl_reg']['weight'] > 0.:
+
+                inside_volume = signed_dist< 0
+                raw_inside_volume = all_ret['raw'].reshape(-1, 4)[inside_volume]
+                if inside_volume.sum() > 0:
+                    smpl_reg =  F.mse_loss(
+                        1 - torch.exp(-torch.relu(raw_inside_volume[:, 3])),
+                        torch.ones_like(raw_inside_volume[:, 3])
+                    ) 
+                else:
+                    smpl_reg = torch.tensor(0.0, device=device)
+                loss['smpl_reg'] = smpl_reg
+
+                inside_volume_0 = signed_dist_0< 0
+                raw_inside_volume_0 = all_ret_0['raw'].reshape(-1, 4)[inside_volume_0]
+                if inside_volume_0.sum() > 0:
+                    smpl_reg_0 =  F.mse_loss(
+                        1 - torch.exp(-torch.relu(raw_inside_volume_0[:, 3])),
+                        torch.ones_like(raw_inside_volume_0[:, 3])
+                    ) 
+                else:
+                    smpl_reg_0 = torch.tensor(0.0, device=device)
+                loss['smpl_reg_0'] = smpl_reg_0
+            else:
+                loss['smpl_reg']=torch.tensor(0.0, device=device)
+                loss['smpl_reg_0']=torch.tensor(0.0, device=device)
+
+            if SMLP_REG_DUMMY and losses['smpl_reg_dummy']['weight'] > 0. and np.random.rand()<0.5:
+                pts_dummy=torch.rand_like(pts)*2-1
+                raw_smpl=render_kwargs_train['network_query_fn'](pts, None, render_kwargs_train['network_fn'])
+                v_shaped_canonical_normalize=canonical_coor_normalizer(hand_dict['v_shaped'].detach().reshape(-1,3),clamp=False).detach().reshape(-1,3)
+                mesh_v_shaped_canonical_normalize=Meshes(v_shaped_canonical_normalize.unsqueeze(0),params['mesh_faces'].unsqueeze(0))
+                mesh_v_shaped_canonical_normalize=mesh_subdivider(mesh_v_shaped_canonical_normalize)
+                # Meshes(v_shaped_canonical_normalize.unsqueeze(0),faces.unsqueeze(0))
+                signed_dist_smpl_dummy,_,_=igl.signed_distance(pts_dummy.reshape(-1,3).detach().cpu().numpy(), 
+                                                               mesh_v_shaped_canonical_normalize.verts_packed().squeeze(0).cpu().numpy(), 
+                                                               mesh_v_shaped_canonical_normalize.faces_packed().squeeze(0).cpu().numpy())
+                if DEBUG:
+                    mask=torch.from_numpy(signed_dist_smpl_dummy).to(device)
+                    mask=(mask<0.001)*(mask>-0.001)
+                    pts_dummy_save=(pts_dummy.clone().detach().reshape(-1,3)[mask]).cpu().numpy()
+                    hand_verts_save=mesh_v_shaped_canonical_normalize.verts_packed().squeeze(0).cpu().numpy()
+                    save_points(pts_dummy_save,hand_verts_save,'pts_dummy_vs_hand_verts.ply')
+
+
+                inside_volume_smpl_dummy = signed_dist_smpl_dummy< 0
+                raw_inside_volume_smpl_dummy = raw_smpl.reshape(-1, 4)[inside_volume_smpl_dummy]
+                raw_outside_volume_smpl_dummy = raw_smpl.reshape(-1, 4)[~inside_volume_smpl_dummy]
+
+                if DEBUG:
+                    mask=inside_volume_smpl_dummy
+                    pts_dummy_save=(pts_dummy.clone().detach().reshape(-1,3)[mask]).cpu().numpy()
+                    hand_verts_save=mesh_v_shaped_canonical_normalize.verts_packed().squeeze(0).cpu().numpy()
+                    save_points(pts_dummy_save,hand_verts_save,'pts_inside_vs_hand_verts.ply')
+
+
+                if inside_volume_smpl_dummy.sum() > 0:
+                    smpl_reg_dummy =  F.mse_loss(
+                        1 - torch.exp(-torch.relu(raw_inside_volume_smpl_dummy[:, 3])),
+                        torch.ones_like(raw_inside_volume_smpl_dummy[:, 3])
+                    )
+                else:
+                    smpl_reg_dummy = torch.tensor(0.0, device=device)
+                if ~inside_volume_smpl_dummy.sum() > 0:
+                    smpl_reg_dummy = smpl_reg_dummy + F.mse_loss(
+                        torch.exp(-torch.relu(raw_outside_volume_smpl_dummy[:, 3])),
+                        torch.ones_like(raw_outside_volume_smpl_dummy[:, 3])
+                    )
+                loss['smpl_reg_dummy'] = smpl_reg_dummy
+
+                raw_smpl_0=render_kwargs_train['network_query_fn'](pts, None, render_kwargs_train['network_fine'])
+                if inside_volume_smpl_dummy.sum() > 0:
+                    smpl_reg_dummy_0 =  F.mse_loss(
+                        1 - torch.exp(-torch.relu(raw_inside_volume_smpl_dummy[:, 3])),
+                        torch.ones_like(raw_inside_volume_smpl_dummy[:, 3])
+                    )
+                else:
+                    smpl_reg_dummy_0 = torch.tensor(0.0, device=device)
+                if ~inside_volume_smpl_dummy.sum() > 0:
+                    smpl_reg_dummy_0 = smpl_reg_dummy_0 + F.mse_loss(
+                        torch.exp(-torch.relu(raw_outside_volume_smpl_dummy[:, 3])),
+                        torch.ones_like(raw_outside_volume_smpl_dummy[:, 3])
+                    )
+                loss['smpl_reg_dummy_0'] = smpl_reg_dummy_0
+            else:
+                loss['smpl_reg_dummy']=torch.tensor(0.0, device=device)
+                loss['smpl_reg_dummy_0']=torch.tensor(0.0, device=device)
+            
+            if losses['lpips']['weight'] > 0. and PATCH:
+                # reshape rgb_map and y_true to (1,PATCH_SIZE,PATCH_SIZE,3)
+                rgb_map_lpips=rgb_map.reshape(1,PATCH_SIZE,PATCH_SIZE,3)
+                y_gt_choose_lpips=y_gt_choose.reshape(1,PATCH_SIZE,PATCH_SIZE,3)
+                rgb_map_lpips=rgb_map_lpips.permute(0,3,1,2)
+                y_gt_choose_lpips=y_gt_choose_lpips.permute(0,3,1,2)
+                loss['lpips']=lpips_fn(rgb_map_lpips,y_gt_choose_lpips,normalize=True).mean()
+
+                rgb_map_0_lpips=rgb_map_0.reshape(1,PATCH_SIZE,PATCH_SIZE,3).permute(0,3,1,2)
+                loss['lpips_0']=lpips_fn(rgb_map_0_lpips,y_gt_choose_lpips,normalize=True).mean()
+            else:
+                loss['lpips']=torch.tensor(0.0, device=device)
+                loss['lpips_0']=torch.tensor(0.0, device=device)
+
+
+
+            
+
+            """
             # Check training stage
             # training stage: [shape only, shape and appearance, appearance]
             if epoch_id < configs["training_stage"][0]:
@@ -835,45 +1422,167 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                     # Smooth local texture
                     loss["albedo"] = albedo_reg(params['texture'], uv_mask=params["uv_mask"], std=1.0)
                     loss["normal_reg"] = normal_reg(params['normal_map'], uv_mask=params["uv_mask"])
-            
+            """
             # Weighted sum of the losses
             sum_loss = torch.tensor(0.0, device=device)
             for k, l in loss.items():
                 sum_loss += l * losses[k]["weight"]
                 losses[k]["values"].append(float(l.detach().cpu()))
-                tf_writer.add_scalar(k, l * losses[k]["weight"], n_iter)
+                # tf_writer.add_scalar(k, l * losses[k]["weight"], n_iter)
+                if WANDB:
+                    wandb.log({k: l * losses[k]["weight"]})
+                    if (mini_batch_count %100<4) and PATCH:
+                        # save rgb_map,rgb_map_0 and y_gt_choose
+                        rgb_map_save=rgb_map.reshape(PATCH_SIZE,PATCH_SIZE,3).detach().cpu().numpy()
+                        rgb_map_0_save=rgb_map_0.reshape(PATCH_SIZE,PATCH_SIZE,3).detach().cpu().numpy()
+                        y_gt_choose_save=y_gt_choose.reshape(PATCH_SIZE,PATCH_SIZE,3).detach().cpu().numpy()
+                        wandb.log({"rgb_patch": wandb.Image(rgb_map_save, caption="rgb_patch")})
+                        wandb.log({"rgb_patch_0": wandb.Image(rgb_map_0_save, caption="rgb_patch_0")})
+                        wandb.log({"y_gt_choose_patch": wandb.Image(y_gt_choose_save, caption="y_gt_choose_patch")})
+            
                 # print("%s: %.6f" % (k, l * losses[k]["weight"]))
             
             epoch_loss += sum_loss.detach().cpu()
-            tf_writer.add_scalar('total_loss', sum_loss, n_iter)
-            print("total_loss = %.6f" % sum_loss)
+            # tf_writer.add_scalar('total_loss', sum_loss, n_iter)
+            if WANDB:wandb.log({"total_loss": sum_loss})
+            # report total_loss in bar
+            bar.set_description(("total_loss = %.6f" % sum_loss)+f' global_step:{global_step}' )
+            if TIME:
+                t13=time.time()
+                print(f't12-t13--compute loss:{t13-t12}')
 
             opt_coarse.zero_grad()
             opt_app.zero_grad()
+            optimizer.zero_grad()
+            if TIME:
+                t14=time.time()
+                print(f't13-t14--zero grad:{t14-t13}')
             sum_loss.backward()
-            if COARSE_OPT:
-                opt_coarse.step()
-            if APP_OPT:
-                opt_app.step()
+            if TIME:
+                t15=time.time()
+                print(f't14-t15--backward:{t15-t14}')
+            optimizer.step()
+            nerf_scheduler.step()
+            if TIME:
+                t16=time.time()
+                print(f't15-t16--step:{t16-t15}')
+
+            # if COARSE_OPT:
+            #     opt_coarse.step()
+            # if APP_OPT:
+            #     opt_app.step()
             
             frame_count += batch_size
             n_iter += 1
             # Delete the variables to free up memory
-            del y_pred
+            # del y_pred
             del loss
-        
-        if COARSE_OPT:
-            sched_coarse.step(epoch_loss / mini_batch_count)
+            del rgb_map, disp_map, acc_map, weights, rgb_map_0, disp_map_0, acc_map_0, weights_0
+            torch.cuda.empty_cache()
 
+            if LOG_IMGAGE and epoch_id % 1 == 0 and mini_batch_count == 0:
+            # if True:
+                with torch.no_grad():
+                    rgb_all_0,rgb_all=render_whole_image(args,params,H,W,
+                                                         configs,hand_verts,faces,fid,
+                                                         render_kwargs_test,hand_dict,
+                                                         canonical_coor_normalizer,hand_joints,(y_sil_true_dil>0.).squeeze(0),device) # (H, W, 3) on cuda, range 0-1
+                    # save to wandb, with gt
+                    if WANDB:
+                        wandb.log({"rgb_all_0": wandb.Image(rgb_all_0.detach().cpu().numpy(), caption="rgb_all_0")})
+                        wandb.log({"rgb_all": wandb.Image(rgb_all.detach().cpu().numpy(), caption="rgb_all")})
+                        # y_true
+                        wandb.log({"y_true": wandb.Image(y_true.detach().cpu().numpy(), caption="y_true")})
+
+                    # compute psnr,lpips
+                    y_true_masked=y_true.squeeze(0)*y_sil_true.squeeze(0).unsqueeze(-1) # (H, W, 3) 
+                    psnr_0=(10*torch.log10(1./((rgb_all_0-y_true_masked)**2).mean())).item()
+                    psnr=(10*torch.log10(1./((rgb_all-y_true_masked)**2).mean())).item()
+                    lpips_0=lpips_fn(rgb_all_0.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
+                    lpips_=lpips_fn(rgb_all.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
+                    # save to wandb
+                    if WANDB:
+                        wandb.log({"psnr_0_train": psnr_0})
+                        wandb.log({"psnr_train": psnr})
+                        wandb.log({"lpips_0_train": lpips_0})
+                        wandb.log({"lpips_train": lpips_})
+
+
+            global_step += 1
+            if global_step % args.i_weights == 0:
+                path = os.path.join(args.basedir, args.expname, '{:06d}.tar'.format(global_step))
+                torch.save({
+                    'global_step': global_step,
+                    'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict() if render_kwargs_train[
+                        'network_fn'] is not None else None,
+                    'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict() if render_kwargs_train[
+                        'network_fine'] is not None else None,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, path)
+                print('Saved checkpoints at', path)
+            
+            mini_batch_count += 1
+            
         print(" Epoch loss = %.6f" % (epoch_loss / mini_batch_count))
-        tf_writer.add_scalar('total_loss_epoch', (epoch_loss / mini_batch_count), epoch_id)
+        # tf_writer.add_scalar('total_loss_epoch', (epoch_loss / mini_batch_count), epoch_id)
+        wandb.log({"total_loss_epoch": (epoch_loss / mini_batch_count)})
 
-        if epoch_id % 20 == 0:
-            visualize_val(val_images_dataloader, epoch_id, device, params, val_params, configs, hand_layer,
-                          mesh_subdivider, opt_app, use_verts_textures, GLOBAL_POSE, SHARED_TEXTURE)
+        if epoch_id % 25==0 and epoch_id>0:
+            # traverse val dataloader
+            with torch.no_grad():
+                average_psnr_0=0
+                average_psnr=0
+                average_lpips_0=0
+                average_lpips=0
+                idx_val=0
+                for (fid, y_true, y_sil_true, 
+                     y_sil_true_ero, y_sil_true_dil) in (tqdm(val_images_dataloader,desc='Running validation')):
+                    y_sil_true = y_sil_true.squeeze(-1).squeeze(0).to(device)
+                    y_true=y_true.squeeze(0).to(device)
+                    y_sil_true_ero=y_sil_true_ero.squeeze(-1).squeeze(0).to(device)
+                    y_sil_true_dil=y_sil_true_dil.squeeze(-1).squeeze(0).to(device)
+                    rgb_all_0,rgb_all=render_whole_image(args,params,H,W,
+                                                         configs,hand_verts,faces,fid,
+                                                         render_kwargs_test,hand_dict,
+                                                         canonical_coor_normalizer,hand_joints,(y_sil_true_dil>0.).squeeze(0),device)
+                    # save to wandb, with gt
+                    if WANDB and idx_val%20==0:
+                        wandb.log({"rgb_all_0_val": wandb.Image(rgb_all_0.detach().cpu().numpy(), caption="rgb_all_0_val")})
+                        wandb.log({"rgb_all_val": wandb.Image(rgb_all.detach().cpu().numpy(), caption="rgb_all_val")})
+                        # y_true
+                        wandb.log({"y_true_val": wandb.Image(y_true.detach().cpu().numpy(), caption="y_true_val")})
+                    
+                    # compute psnr,lpips
+                    y_true_masked=y_true.squeeze(0)*y_sil_true.squeeze(0).unsqueeze(-1) # (H, W, 3)
+                    psnr_0=(10*torch.log10(1./((rgb_all_0-y_true_masked)**2).mean())).item()
+                    psnr=(10*torch.log10(1./((rgb_all-y_true_masked)**2).mean())).item()
+                    lpips_0=lpips_fn(rgb_all_0.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
+                    lpips_=lpips_fn(rgb_all.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
+                    
+                    # add to average
+                    average_psnr_0+=psnr_0
+                    average_psnr+=psnr
+                    average_lpips_0+=lpips_0
+                    average_lpips+=lpips_
+                    idx_val+=1
 
-        if epoch_id % 200 == 0 and epoch_id > 0:
-            file_utils.save_result(params, base_output_dir, test=configs["known_appearance"])
+                average_psnr_0=average_psnr_0/len(val_images_dataloader)
+                average_psnr=average_psnr/len(val_images_dataloader)
+                average_lpips_0=average_lpips_0/len(val_images_dataloader)
+                average_lpips=average_lpips/len(val_images_dataloader)
+                # save to wandb
+                if WANDB:
+                    wandb.log({"psnr_0_val": average_psnr_0})
+                    wandb.log({"psnr_val": average_psnr})
+                    wandb.log({"lpips_0_val": average_lpips_0})
+                    wandb.log({"lpips_val": average_lpips})
+
+        # if epoch_id % 20 == 0:
+        #     visualize_val(val_images_dataloader, epoch_id, device, params, val_params, configs, hand_layer,
+        #                   mesh_subdivider, opt_app, use_verts_textures, GLOBAL_POSE, SHARED_TEXTURE)
+
+        # if epoch_id % 200 == 0 and epoch_id > 0:
+        #     file_utils.save_result(params, base_output_dir, test=configs["known_appearance"])
     #### Done Optimization ####
 
     # Save results
@@ -1099,207 +1808,6 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
             for (k, v) in final_stats.items():
                 f_out.write(" %s: %.5f\n" % (k, v))
 
-# def config_parser():
-#     import configargparse
-#     parser = configargparse.ArgumentParser()
-#     parser.add_argument('--config', is_config_file=True,
-#                         help='config file path')
-#     parser.add_argument("--expname", type=str,
-#                         help='experiment name')
-#     parser.add_argument("--basedir", type=str, default='./logs/',
-#                         help='where to store ckpts and logs')
-#     parser.add_argument("--datadir", type=str, default='./data/llff/fern',
-#                         help='input data directory')
-
-#     # training options
-#     parser.add_argument("--netdepth", type=int, default=8,
-#                         help='layers in network')
-#     parser.add_argument("--netwidth", type=int, default=256,
-#                         help='channels per layer')
-#     parser.add_argument("--netdepth_fine", type=int, default=8,
-#                         help='layers in fine network')
-#     parser.add_argument("--netwidth_fine", type=int, default=256,
-#                         help='channels per layer in fine network')
-#     parser.add_argument("--N_rand", type=int, default=32 * 32 * 4,
-#                         help='batch size (number of random rays per gradient step)')
-#     parser.add_argument("--lrate", type=float, default=0.01,
-#                         help='learning rate')
-#     parser.add_argument("--lrate_decay", type=float, default=10,
-#                         help='exponential learning rate decay (in 1000 steps)')
-#     parser.add_argument("--chunk", type=int, default=1024 * 32,
-#                         help='number of rays processed in parallel, decrease if running out of memory')
-#     parser.add_argument("--netchunk", type=int, default=1024 * 64,
-#                         help='number of pts sent through network in parallel, decrease if running out of memory')
-#     parser.add_argument("--no_batching", action='store_true',
-#                         help='only take random rays from 1 image at a time')
-#     parser.add_argument("--no_reload", action='store_true',
-#                         help='do not reload weights from saved ckpt')
-#     parser.add_argument("--ft_path", type=str, default=None,
-#                         help='specific weights npy file to reload for coarse network')
-
-#     # rendering options
-#     parser.add_argument("--N_samples", type=int, default=64,
-#                         help='number of coarse samples per ray')
-#     parser.add_argument("--N_importance", type=int, default=0,
-#                         help='number of additional fine samples per ray')
-#     parser.add_argument("--perturb", type=float, default=1.,
-#                         help='set to 0. for no jitter, 1. for jitter')
-#     parser.add_argument("--use_viewdirs", action='store_true',
-#                         help='use full 5D input instead of 3D')
-#     parser.add_argument("--i_embed", type=int, default=0,
-#                         help='set 0 for default positional encoding, -1 for none')
-#     parser.add_argument("--multires", type=int, default=10,
-#                         help='log2 of max freq for positional encoding (3D location)')
-#     parser.add_argument("--multires_views", type=int, default=4,
-#                         help='log2 of max freq for positional encoding (2D direction)')
-#     parser.add_argument("--raw_noise_std", type=float, default=0.,
-#                         help='std dev of noise added to regularize sigma_a output, 1e0 recommended')
-
-#     parser.add_argument("--render_only", action='store_true',
-#                         help='do not optimize, reload weights and render out render_poses path')
-#     parser.add_argument("--render_test", action='store_true',
-#                         help='render the test set instead of render_poses path')
-#     parser.add_argument("--render_test_ray", action='store_true',
-#                         help='render the test set instead of render_poses path')
-#     parser.add_argument("--render_train", action='store_true',
-#                         help='render the train set instead of render_poses path')
-#     parser.add_argument("--render_mypath", action='store_true',
-#                         help='render the test path')
-#     parser.add_argument("--render_factor", type=int, default=0,
-#                         help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
-
-#     # training options
-#     parser.add_argument("--precrop_iters", type=int, default=0,
-#                         help='number of steps to train on central crops')
-#     parser.add_argument("--precrop_frac", type=float,
-#                         default=.5, help='fraction of img taken for central crops')
-
-#     # dataset options
-#     parser.add_argument("--dataset_type", type=str, default='llff',
-#                         help='options: llff / blender / deepvoxels')
-#     parser.add_argument("--testskip", type=int, default=8,
-#                         help='will load 1/N images from test/val sets, useful for large datasets like deepvoxels')
-
-#     # deepvoxels flags
-#     parser.add_argument("--shape", type=str, default='greek',
-#                         help='options : armchair / cube / greek / vase')
-
-#     # blender flags
-#     parser.add_argument("--white_bkgd", action='store_true',
-#                         help='set to render synthetic data on a white bkgd (always use for dvoxels)')
-#     parser.add_argument("--half_res", action='store_true',
-#                         help='load blender synthetic data at 400x400 instead of 800x800')
-
-#     # llff flags
-#     parser.add_argument("--factor", type=int, default=8,
-#                         help='downsample factor for LLFF images')
-#     parser.add_argument("--no_ndc", action='store_true',
-#                         help='do not use normalized device coordinates (set for non-forward facing scenes)')
-#     parser.add_argument("--lindisp", action='store_true',
-#                         help='sampling linearly in disparity rather than depth')
-#     parser.add_argument("--spherify", action='store_true',
-#                         help='set for spherical 360 scenes')
-#     parser.add_argument("--llffhold", type=int, default=1000000,
-#                         help='will take every 1/N images as LLFF test set, paper uses 8')
-
-#     # logging/saving options
-#     parser.add_argument("--i_print", type=int, default=100,
-#                         help='frequency of console printout and metric loggin')
-#     parser.add_argument("--i_img", type=int, default=500,
-#                         help='frequency of tensorboard image logging')
-#     parser.add_argument("--i_weights", type=int, default=10000,
-#                         help='frequency of weight ckpt saving')
-#     parser.add_argument("--i_testset", type=int, default=100000,
-#                         help='frequency of testset saving')
-#     parser.add_argument("--i_video", type=int, default=50000,
-#                         help='frequency of render_poses video saving')
-
-#     # debug
-#     parser.add_argument("--debug", action='store_true')
-
-#     # new experiment by kangle
-#     parser.add_argument("--N_iters", type=int, default=200000,
-#                         help='number of iters')
-#     parser.add_argument("--alpha_model_path", type=str, default=None,
-#                         help='predefined alpha model')
-#     parser.add_argument("--no_coarse", action='store_true',
-#                         help="Remove coarse network.")
-#     parser.add_argument("--train_scene", nargs='+', type=int,
-#                         help='id of scenes used to train')
-#     parser.add_argument("--test_scene", nargs='+', type=int,
-#                         help='id of scenes used to test')
-#     parser.add_argument("--colmap_depth", action='store_true',
-#                         help="Use depth supervision by colmap.")
-#     parser.add_argument("--depth_loss", action='store_true',
-#                         help="Use depth supervision by colmap - depth loss.")
-#     parser.add_argument("--depth_lambda", type=float, default=0.1,
-#                         help="Depth lambda used for loss.")
-#     parser.add_argument("--sigma_loss", action='store_true',
-#                         help="Use depth supervision by colmap - sigma loss.")
-#     parser.add_argument("--sigma_lambda", type=float, default=0.1,
-#                         help="Sigma lambda used for loss.")
-#     parser.add_argument("--weighted_loss", action='store_true',
-#                         help="Use weighted loss by reprojection error.")
-#     parser.add_argument("--relative_loss", action='store_true',
-#                         help="Use relative loss.")
-#     parser.add_argument("--depth_with_rgb", action='store_true',
-#                         help="single forward for both depth and rgb")
-#     parser.add_argument("--normalize_depth", action='store_true',
-#                         help="normalize depth before calculating loss")
-
-#     parser.add_argument("--no_tcnn", action='store_true',
-#                         help='set to not use tinycudann and use the original NeRF')
-
-#     parser.add_argument("--clf_weight", type=float, default=0.01,
-#                         help='The weight of the classification loss')
-#     parser.add_argument("--clf_reg_weight", type=float, default=0.01,
-#                         help='The weight of the classification regularizer')
-#     parser.add_argument("--feat_weight", type=float,
-#                         default=0.01, help='The weight of the feature loss')
-#     parser.add_argument("--i_feat", type=int, default=10,
-#                         help='frequency of calculating the feature loss')
-#     parser.add_argument("--prepare", action='store_true',
-#                         help='Prepare depths for inpainting')
-#     parser.add_argument("--lpips", action='store_true',
-#                         help='use perceptual loss for rgb inpainting')
-#     parser.add_argument("--N_gt", type=int, default=0,
-#                         help='Number of ground truth inpainted samples')
-#     parser.add_argument("--N_train", type=int, default=None,
-#                         help='Number of training images used for optimization')
-#     parser.add_argument("--train_gt", action='store_true',
-#                         help='Use the gt inpainted images to train a NeRF')
-#     parser.add_argument("--masked_NeRF", action='store_true',
-#                         help='Only train NeRF on unmasked pixels')
-#     parser.add_argument("--object_removal", action='store_true',
-#                         help='Remove the object and shrink the masks')
-#     parser.add_argument("--tmp_images", action='store_true',
-#                         help='Use images in lama_images_tmp for ablation studies')
-#     parser.add_argument("--no_geometry", action='store_true',
-#                         help='Stop using inpainted depths for training')
-
-#     parser.add_argument("--lpips_render_factor", type=int, default=2,
-#                         help='The stride (render factor) used for sampling patches for the perceptual loss')
-#     parser.add_argument("--patch_len_factor", type=int, default=8,
-#                         help='The resizing factor to obtain the side lengths of the patches for the perceptual loss')
-#     parser.add_argument("--lpips_batch_size", type=int, default=4,
-#                         help='The number of patches used in each iteration for the perceptual loss')
-
-#     # NEW
-#     # vis_triplane
-#     parser.add_argument("--vis_triplane", action='store_true',
-#                         help='Visualize triplane and exit')
-#     # tv_lambda
-#     parser.add_argument("--tv_lambda", type=float, default=0.,
-#                         help='The weight of the TV loss')
-#     # sparse_lambda
-#     parser.add_argument("--sparse_lambda", type=float, default=0.,
-#                         help='The weight of the sparse loss')
-#     # edr_lambda
-#     parser.add_argument("--edr_lambda", type=float, default=0.,
-#                         help='The weight of the EDR loss')
-
-
-#     return parser
 
 def main():
     # Get config

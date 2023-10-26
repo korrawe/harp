@@ -319,18 +319,19 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
 
 # Hierarchical sampling (section 5.2)
 def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
+    device=weights.device
     # Get pdf
     weights = weights + 1e-5  # prevent nans
     pdf = weights / torch.sum(weights, -1, keepdim=True)
     cdf = torch.cumsum(pdf, -1)
-    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)  # (batch, len(bins))
+    cdf = torch.cat([torch.zeros_like(cdf[..., :1],device=device), cdf], -1)  # (batch, len(bins))
 
     # Take uniform samples
     if det:
-        u = torch.linspace(0., 1., steps=N_samples)
+        u = torch.linspace(0., 1., steps=N_samples,device=device)
         u = u.expand(list(cdf.shape[:-1]) + [N_samples])
     else:
-        u = torch.rand(list(cdf.shape[:-1]) + [N_samples])
+        u = torch.rand(list(cdf.shape[:-1]) + [N_samples],device=device)
 
     # Pytest, overwrite u with numpy's fixed random numbers
     if pytest:
@@ -381,14 +382,14 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     raw2alpha = lambda raw, dists, act_fn=F.relu: 1. - torch.exp(-act_fn(raw) * dists)  # todo change relu to trunc_exp
 
     dists = z_vals[..., 1:] - z_vals[..., :-1]
-    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[..., :1].shape)], -1)  # [N_rays, N_samples]
+    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[..., :1].shape).to(dists.device)], -1)  # [N_rays, N_samples]
 
     dists = dists * torch.norm(rays_d[..., None, :], dim=-1)
 
     rgb = torch.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3]
     noise = 0.
     if raw_noise_std > 0.:
-        noise = torch.randn(raw[..., 3].shape) * raw_noise_std
+        noise = torch.randn(raw[..., 3].shape,device=dists.device) * raw_noise_std
 
         # Overwrite randomly sampled data if pytest
         if pytest:
@@ -398,7 +399,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
 
     alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
     # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1. - alpha + 1e-10], -1), -1)[:, :-1]
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1),device=alpha.device), 1. - alpha + 1e-10], -1), -1)[:, :-1]
     if detach_weights:
         rgb_map = torch.sum(weights[..., None].detach() * rgb, -2)  # [N_rays, 3]
     else:
@@ -407,6 +408,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
     acc_map = torch.sum(weights, -1)
+    rgb_map=rgb_map.clamp(1e-6,1-1e-6)
 
     if white_bkgd:
         rgb_map = rgb_map + (1. - acc_map[..., None])

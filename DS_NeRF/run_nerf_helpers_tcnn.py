@@ -20,7 +20,7 @@ class NeRF_TCNN(nn.Module):
                  geo_feat_dim=15,  # original value is 15
                  num_layers_color=3,  # original value is 3
                  hidden_dim_color=64,  # original value is 64
-                 bound=100,
+                 bound=1,
                  base_resolution=16,
                  **kwargs
                  ):
@@ -73,7 +73,7 @@ class NeRF_TCNN(nn.Module):
             },
         )
 
-        self.in_dim_color = self.encoder_dir.n_output_dims + self.geo_feat_dim
+        self.in_dim_color =  self.geo_feat_dim
 
         self.color_net = tcnn.Network(
             n_input_dims=self.in_dim_color,
@@ -89,25 +89,15 @@ class NeRF_TCNN(nn.Module):
 
     def forward(self, input):
         x = input[:, :3]
-        d = input[:, 3:]
 
-        # x: [N, 3], in [-bound, bound]
-        # d: [N, 3], nomalized in [-1, 1]
-
-        # sigma
-        x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
+        # x: [N, 3], in [-1, 1]
         x = self.encoder(x)
         h = self.sigma_net(x)
 
         sigma = h[..., 0]
         geo_feat = h[..., 1:]
 
-        # color
-        d = (d + 1) / 2  # tcnn SH encoding requires inputs to be in [0, 1]
-        d = self.encoder_dir(d)
-
-        # p = torch.zeros_like(geo_feat[..., :1]) # manual input padding
-        h = torch.cat([d, geo_feat], dim=-1)
+        h = geo_feat
         h = self.color_net(h)
 
         # sigmoid activation for rgb

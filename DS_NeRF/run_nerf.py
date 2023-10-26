@@ -402,7 +402,7 @@ def create_nerf(args):
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(
             args.multires_views, args.i_embed)
-    output_ch = 5 if args.N_importance > 0 else 4
+    output_ch = 4 if args.N_importance > 0 else 4
     skips = [4]
     if args.alpha_model_path is None:
         model = NeRF(D=args.netdepth, W=args.netwidth,
@@ -545,10 +545,8 @@ def create_nerf_tcnn(args):
    ##########################
 
     # Load checkpoints
-    if args.ft_path is not None and args.ft_path != 'None' :
-        ckpts = [args.ft_path]
-    else:
-        ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if
+
+    ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if
                  'tar' in f]
     # if args.alpha_model_path is not None:
     #     ckpts=[args.alpha_model_path] if args.alpha_model_path.endswith(".pth") or args.alpha_model_path.endswith(".tar") \
@@ -556,7 +554,7 @@ def create_nerf_tcnn(args):
     # else:
     #     ckpts = []
 
-    if args.masked_NeRF or args.object_removal or args.no_reload:
+    if args.no_reload:
         ckpts = []
 
     print(f'Found ckpts {ckpts} no_reload {args.no_reload},')
@@ -760,6 +758,7 @@ def render_rays(ray_batch,
 def render_rays_given_pts(pts,rays_o,rays_d,z_vals,
                 network_fn,
                 network_query_fn,
+                N_samples,
                 retraw=False,
                 perturb=0.,
                 N_importance=0,
@@ -769,7 +768,10 @@ def render_rays_given_pts(pts,rays_o,rays_d,z_vals,
                 pytest=False,
                 # sigma_loss=None,
                 need_alpha=False,
-                detach_weights=False
+                detach_weights=False,
+                use_viewdirs=False,
+                fine_stage=False,
+                **kwargs
                 ):
     """Volumetric rendering.
     Args:
@@ -798,48 +800,50 @@ def render_rays_given_pts(pts,rays_o,rays_d,z_vals,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
-    viewdirs=rays_d/rays_d.norm(dim=-1,keepdim=True)
+    viewdirs=rays_d/rays_d.norm(dim=-1,keepdim=True) if use_viewdirs else None
 
-    if network_fn is not None:
-        raw = network_query_fn(pts, viewdirs, network_fn)
-        rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
-                                                                            white_bkgd, pytest=pytest,
-                                                                            need_alpha=need_alpha,
-                                                                            detach_weights=detach_weights)
-    else:
-        if network_fine.alpha_model is not None:
-            raw = network_query_fn(pts, viewdirs, network_fine.alpha_model)
-            rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
-                                                                                white_bkgd, pytest=pytest,
-                                                                                need_alpha=need_alpha,
-                                                                                detach_weights=detach_weights)
-        else:
-            raw = network_query_fn(pts, viewdirs, network_fine)
-            rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
-                                                                                white_bkgd, pytest=pytest,
-                                                                                need_alpha=need_alpha,
-                                                                                detach_weights=detach_weights)
+    run_fn = network_fn if fine_stage else network_fine
 
-    if N_importance > 0:
-        rgb_map_0, disp_map_0, acc_map_0, alpha0 = rgb_map, disp_map, acc_map, alpha
+    # if network_fn is not None:
+    #     raw = network_query_fn(pts, viewdirs, network_fn)
+    #     rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
+    #                                                                         white_bkgd, pytest=pytest,
+    #                                                                         need_alpha=need_alpha,
+    #                                                                         detach_weights=detach_weights)
+    # else:
+    #     if network_fine.alpha_model is not None:
+    #         raw = network_query_fn(pts, viewdirs, network_fine.alpha_model)
+    #         rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
+    #                                                                             white_bkgd, pytest=pytest,
+    #                                                                             need_alpha=need_alpha,
+    #                                                                             detach_weights=detach_weights)
+    #     else:
+    raw = network_query_fn(pts, viewdirs, run_fn)
+    rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
+                                                                        white_bkgd, pytest=pytest,
+                                                                        need_alpha=need_alpha,
+                                                                        detach_weights=detach_weights)
 
-        z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-        z_samples = sample_pdf(
-            z_vals_mid, weights[..., 1:-1], N_importance, det=(perturb == 0.), pytest=pytest)
-        z_samples = z_samples.detach()
+    # if N_importance > 0:
+    #     rgb_map_0, disp_map_0, acc_map_0, alpha0 = rgb_map, disp_map, acc_map, alpha
 
-        z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
-        pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :,
-                                                                   None]  # [N_rays, N_samples + N_importance, 3]
+    #     z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+    #     z_samples = sample_pdf(
+    #         z_vals_mid, weights[..., 1:-1], N_importance, det=(perturb == 0.), pytest=pytest)
+    #     z_samples = z_samples.detach()
 
-        run_fn = network_fn if network_fine is None else network_fine
+    #     z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+    #     pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :,
+    #                                                                None]  # [N_rays, N_samples + N_importance, 3]
 
-        raw = network_query_fn(pts, viewdirs, run_fn)
+    #     run_fn = network_fn if network_fine is None else network_fine
 
-        rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
-                                                                            white_bkgd, pytest=pytest,
-                                                                            need_alpha=need_alpha,
-                                                                            detach_weights=detach_weights)
+    #     raw = network_query_fn(pts, viewdirs, run_fn)
+
+    #     rgb_map, disp_map, acc_map, weights, depth_map, alpha = raw2outputs(raw, z_vals, rays_d, raw_noise_std,
+    #                                                                         white_bkgd, pytest=pytest,
+    #                                                                         need_alpha=need_alpha,
+    #                                                                         detach_weights=detach_weights)
 
     ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map, 'depth_map': depth_map,
            'weights': weights, 'z_vals': z_vals}
@@ -847,12 +851,12 @@ def render_rays_given_pts(pts,rays_o,rays_d,z_vals,
         ret['raw'] = raw
     if need_alpha:
         ret['alpha'] = alpha
-        ret['alpha0'] = alpha0
-    if N_importance > 0:
-        ret['rgb0'] = rgb_map_0
-        ret['disp0'] = disp_map_0
-        ret['acc0'] = acc_map_0
-        ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
+    #     ret['alpha0'] = alpha0
+    # if N_importance > 0:
+    #     ret['rgb0'] = rgb_map_0
+    #     ret['disp0'] = disp_map_0
+    #     ret['acc0'] = acc_map_0
+    #     ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
 
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
