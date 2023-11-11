@@ -89,8 +89,8 @@ class NeRF_TCNN(nn.Module):
 
     def forward(self, input):
         x = input[:, :3]
-
         # x: [N, 3], in [-1, 1]
+        # x=(x+self.bound)/(2*self.bound) # to [0,1]
         x = self.encoder(x)
         h = self.sigma_net(x)
 
@@ -224,7 +224,7 @@ class NeRF_TCNN_(nn.Module):
         # d: [N, 3], nomalized in [-1, 1]
 
         # sigma
-        x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
+        # x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
         x = self.encoder(x)
         h = self.sigma_net(x)
 
@@ -378,5 +378,6 @@ class NeRF_TCNN_(nn.Module):
         save_path=os.path.join(vis_dir,'_'.join(additional_message)+'.png')
         plt.imsave(save_path,feature)
     
+
 
 

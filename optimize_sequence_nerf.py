@@ -67,6 +67,7 @@ def show_img_pair(ypred_np, ytrue_np, step=-1, silhouette=False, save_img_dir=No
             if idx_list[idx] >= len(ypred_np):
                 break
             if silhouette:
+
                 overlay = np.zeros([*ytrue_np[idx_list[idx]].shape[:2], 3])
                 overlay[:, :, 0] = ytrue_np[idx_list[idx]]
                 overlay[:, :, 2] = ypred_np[idx_list[idx]]
@@ -273,7 +274,7 @@ def init_params(input_params, VERT_DISPS, VERT_DISPS_NORMALS, VERTS_COLOR, mano_
 
 def get_optimizers(params, configs):
     pose_params = [params['pose'], params['cam']]
-    if configs["use_vert_disp"]:
+    if configs["use_vert_disp"] and False:
         shape_params = [params['verts_disps'], params['shape']]
     else:
         shape_params = [params['shape']]
@@ -284,29 +285,29 @@ def get_optimizers(params, configs):
     if configs["known_appearance"]:
         if configs["use_arm"] and configs["opt_arm_pose"]:
             opt_coarse = torch.optim.Adam([
-                    {'params': pose_params, 'lr': 1.0e-3},
-                    {'params': [params['wrist_pose'], params['rot']], 'lr': 1.0e-3},
+                    {'params': pose_params, 'lr': 1.0e-4},
+                    {'params': [params['wrist_pose'], params['rot']], 'lr': 1.0e-4},
                 ])
         else:
             opt_coarse = torch.optim.Adam([
-                    {'params': pose_params, 'lr': 1.0e-3},
+                    {'params': pose_params, 'lr': 1.0e-4},
                 ])
     else:
         if configs['model_type'] == 'nimble':
             opt_coarse = torch.optim.Adam([
-                    {'params': pose_params, 'lr': 1.0e-3},
+                    {'params': pose_params, 'lr': 1.0e-4},
                     {'params': [params['wrist_pose'], params['rot']], 'lr': 1.0e-2},
                 ])
         elif configs["use_arm"] and configs["opt_arm_pose"]:
             opt_coarse = torch.optim.Adam([
-                    {'params': pose_params, 'lr': 1.0e-3},
-                    {'params': [params['wrist_pose'], params['rot']], 'lr': 1.0e-3},
-                    {'params': shape_params, 'lr': 1.0e-3}
+                    {'params': pose_params, 'lr': 1.0e-4},
+                    {'params': [params['wrist_pose'], params['rot']], 'lr': 1.0e-4},
+                    {'params': shape_params, 'lr': 1.0e-4}
                 ])
         else:
             opt_coarse = torch.optim.Adam([
-                    {'params': pose_params, 'lr': 1.0e-3},
-                    {'params': shape_params, 'lr': 1.0e-3}
+                    {'params': pose_params, 'lr': 1.0e-4},
+                    {'params': shape_params, 'lr': 1.0e-4}
                 ])
 
     common_app_params = [params['light_positions'], params['amb_ratio']]
@@ -491,6 +492,8 @@ def warp_samples_to_canonical_diff(pts_np,verts_np,faces_np, T):
     T_interp_inv = torch.inverse(T_interp)
     return T_interp_inv, torch.from_numpy(f_id), torch.from_numpy(signed_dist)
 
+
+
 def pts_w2canonical(pts,verts,faces,pts_np,verts_np,faces_np,hand_dict,return_dict=False):
     """ Transform pts from world to canonical space
     pts:(batch_size, N, 3)
@@ -630,19 +633,89 @@ def sample_patch(mask, patch_size):
     
     return patch_mask
 
+def render_whole_image_canonical(args,params,H,W,configs,
+                       hand_verts,faces,fid,
+                       render_kwargs,hand_dict,
+                       canonical_coor_normalizer,hand_joints,
+                       device='cuda',rays_d=None,rays_o=None):
+    if rays_o is not None:
+        assert rays_d is not None
+    else:
+        rays_o, rays_d = get_rays(H, W, configs['focal_length'], torch.linalg.inv(params['w2c'][fid].squeeze()))
+    rays_o_reshape = rays_o.reshape(-1, 3)
+    rays_d_reshape = rays_d.reshape(-1, 3)
+    near, far = rays_o.norm(-1).mean()-0.8,rays_o.norm(-1).mean()+0.8
+
+    hit_mask_near_far=near<far
+    near = near[hit_mask_near_far]
+    far = far[hit_mask_near_far]
+    rays_o_reshape = rays_o_reshape[hit_mask_near_far]
+    rays_d_reshape = rays_d_reshape[hit_mask_near_far]
+    if near.shape[0] < 100:
+        raise Exception('too few rays, please check the camera pose')
+
+    # get points between near and far with args.N_samples intervals
+    t_vals = torch.linspace(0., 1., steps=args.N_samples, device=device)
+    # expand
+    z_vals = near[..., None] * (1. - t_vals[None, ...]) + far[..., None] * (t_vals[None, ...]) # (N_rays, N_samples)
+
+    if render_kwargs['perturb'] > 0.:
+        # get intervals between samples
+        mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+        upper = torch.cat([mids, z_vals[..., -1:]], -1)
+        lower = torch.cat([z_vals[..., :1], mids], -1)
+        # stratified samples in those intervals
+        t_rand = torch.rand(z_vals.shape).to(device)
+        z_vals = lower + (upper - lower) * t_rand
+
+
+    pts = rays_o_reshape[..., None, :] + rays_d_reshape[..., None, :] * z_vals[..., :, None] # (N_rays, N_samples, 3)
+
+    pts=pts.reshape(-1,z_vals.shape[-1],3)
+
+    all_ret_0=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals, **render_kwargs)
+
+    rgb_map_0, disp_map_0, acc_map_0,weights_0 = all_ret_0['rgb_map'], all_ret_0['disp_map'], all_ret_0['acc_map'], all_ret_0['weights']
+    alpha_0=all_ret_0['alpha'] if 'alpha' in all_ret_0 else None
+
+    z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+    z_samples = sample_pdf(
+        z_vals_mid, weights_0[..., 1:-1], args.N_importance, det=(render_kwargs['perturb'] == 0.))
+    z_samples = z_samples.detach()
+
+    z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+    pts = rays_o_reshape[..., None, :] + rays_d_reshape[..., None, :] * z_vals[..., :,
+                                                                None]  # [N_rays, N_samples + N_importance, 3]
+
+    pts=pts.reshape(-1,z_vals.shape[-1],3)
+
+    all_ret=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals,fine_stage=True, **render_kwargs)
+
+    rgb_map, disp_map, acc_map, weights = all_ret['rgb_map'], all_ret['disp_map'], all_ret['acc_map'], all_ret['weights']
+
+    rgb_all_0=torch.zeros((H,W,3)).to(device)
+    rgb_all=torch.zeros((H,W,3)).to(device)
+
+
+
+    return rgb_all_0.clamp(1e-6,1-1e-4),rgb_all.clamp(1e-6,1-1e-4)
+
 
 def render_whole_image(args,params,H,W,configs,
                        hand_verts,faces,fid,
                        render_kwargs,hand_dict,
-                       canonical_coor_normalizer,hand_joints,initial_mask,
-                       device='cuda'):
-    coords = torch.stack(torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
-                                -1)  # (H, W, 2)
-    coords = torch.reshape(coords, [-1, 2]) 
-    rays_o, rays_d = get_rays(H, W, configs['focal_length'], torch.linalg.inv(params['w2c'][fid].squeeze()))
+                       canonical_coor_normalizer,hand_joints,initial_mask=None,
+                       device='cuda',rays_d=None,rays_o=None):
+    if rays_o is not None:
+        assert rays_d is not None
+    else:
+        rays_o, rays_d = get_rays(H, W, configs['focal_length'], torch.linalg.inv(params['w2c'][fid].squeeze()))
     rays_o_reshape = rays_o.reshape(-1, 3)
     rays_d_reshape = rays_d.reshape(-1, 3)
-    hit_mask=initial_mask.reshape(-1)
+    if initial_mask is not None:
+        hit_mask=initial_mask.reshape(-1)
+    else:
+        hit_mask=torch.ones(rays_o_reshape.shape[0],dtype=torch.long,device=device)
     rays_o_reshape=rays_o_reshape[hit_mask]
     rays_d_reshape=rays_d_reshape[hit_mask]
     if False:
@@ -651,6 +724,7 @@ def render_whole_image(args,params,H,W,configs,
                                                         hand_joints.squeeze(),geo_threshold=0.01)
     else:
         near, far = geometry_guided_near_far_torch(rays_o_reshape, rays_d_reshape/rays_d_reshape.norm(dim=-1,keepdim=True), hand_verts.squeeze(),geo_threshold=0.005)
+        
     # hit_mask[hit_mask][near>far]=False
     hit_mask[torch.where(hit_mask)[0][near>far]]=False
     hit_mask_near_far=near<far
@@ -727,12 +801,50 @@ def render_whole_image(args,params,H,W,configs,
     print(f'idx_valid.sum():{idx_valid[0].reshape(-1).shape[0]+idx_valid[1].reshape(-1).shape[0]}')
     print(f'rgb_all_0.max():{rgb_all_0.max()}')
     print(f'rgb_all.max():{rgb_all.max()}')
-    if rgb_all_0.max()<0.3:
-        raise Exception('rgb_all_0.max()<0.3, wrong for all images,fid:{},got render max:{}'.format(fid,rgb_all_0.max()))
 
 
-    return rgb_all_0,rgb_all
+    return rgb_all_0.clamp(1e-6,1-1e-4),rgb_all.clamp(1e-6,1-1e-4)
     
+class Discriminator(nn.Module):
+    def __init__(self):
+        super(Discriminator, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, 4, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(64, 128, 4, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(128, 256, 4, stride=2, padding=1)
+        self.conv4 = nn.Conv2d(256, 512, 4, stride=1, padding=1)
+        self.conv5 = nn.Conv2d(512, 1, 4, stride=1, padding=1)
+        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
+    
+    def forward(self, x):
+        x1 = self.lrelu(self.conv1(x))
+        x2 = self.lrelu(self.conv2(x1))
+        x3 = self.lrelu(self.conv3(x2))
+        x4 = self.lrelu(self.conv4(x3))
+        x5 = torch.sigmoid(self.conv5(x4))
+        return x5
+
+normalize_vecs=lambda x: x/x.norm(-1,keepdim=True)
+
+def create_cam2world_matrix(forward_vector, origin, device=None):
+    """Takes in the direction the camera is pointing and the camera origin and returns a cam2world matrix."""
+
+    forward_vector = normalize_vecs(forward_vector)
+    up_vector = torch.tensor([-1, 0, 0], dtype=torch.float, device=device).expand_as(forward_vector)
+
+    left_vector = normalize_vecs(torch.cross(up_vector, forward_vector, dim=-1))
+
+    up_vector = normalize_vecs(torch.cross(forward_vector, left_vector, dim=-1))
+
+    rotation_matrix = torch.eye(4, device=device).unsqueeze(0).repeat(forward_vector.shape[0], 1, 1)
+    rotation_matrix[:, :3, :3] = torch.stack((-left_vector, up_vector, -forward_vector), axis=-1)
+
+    translation_matrix = torch.eye(4, device=device).unsqueeze(0).repeat(forward_vector.shape[0], 1, 1)
+    translation_matrix[:, :3, 3] = origin
+
+    cam2world = translation_matrix @ rotation_matrix
+
+    return cam2world
+
 
 
 
@@ -745,10 +857,14 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
     WANDB=True
     PATCH=True
     PATCH_SIZE=64
+    TEST_VAL=True
+    ONLY_TEST=False
+    if ONLY_TEST:TEST_VAL=True
     if DEBUG:WANDB=False
     TIME=False
     HARD_SURFACE_OFFSET=0.31326165795326233
     SMLP_REG_DUMMY=True
+    ADVERSARIAL=False
     if WANDB:
         wandb.init(project="hand_nerf", config=configs, dir=configs["base_output_dir"])
     # Coarse optimization, including translation, rotation, pose, shape
@@ -763,7 +879,8 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
     # If vertex texutere is false, use UV map
     use_verts_textures = False
     SHARED_TEXTURE = True
-
+    # anobaly detection
+    torch.autograd.set_detect_anomaly(True)
     LOG_IMGAGE = True
     # Get mesh faces
     # if configs["model_type"] == "html":
@@ -789,47 +906,56 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
     base_output_dir = configs["base_output_dir"]
 
     if len(configs["start_from"]) > 0:
+        print("Loading from previous checkpoint")
         if configs["known_appearance"] and configs["pose_already_opt"]:
             params = file_utils.load_result(configs["start_from"], test=configs["pose_already_opt"])
         else:
             params = file_utils.load_result(configs["start_from"])
-            if configs["known_appearance"]:
-                # For known appearance but new pose. Init pose parameters for optimization
-                params['trans'] = torch.nn.Parameter(input_params['trans'].detach().clone(), requires_grad=True)
-                params['pose'] = torch.nn.Parameter(input_params['pose'].detach().clone(), requires_grad=True)
-                params['rot'] = torch.nn.Parameter(input_params['rot'].detach().clone(), requires_grad=True)
-                params['cam'] = torch.nn.Parameter(input_params['cam'].detach().clone(), requires_grad=True)
+        #     if configs["known_appearance"]:
+        #         # For known appearance but new pose. Init pose parameters for optimization
+        #         params['trans'] = torch.nn.Parameter(input_params['trans'].detach().clone(), requires_grad=True)
+        #         params['pose'] = torch.nn.Parameter(input_params['pose'].detach().clone(), requires_grad=True)
+        #         params['rot'] = torch.nn.Parameter(input_params['rot'].detach().clone(), requires_grad=True)
+        #         params['cam'] = torch.nn.Parameter(input_params['cam'].detach().clone(), requires_grad=True)
 
-        # smooth poses by interpolating every 5 frame
-        temp_pose = params['pose'].detach().clone()
-        for i in range(params['pose'].shape[0] // 30 - 1):
-            for j in range(30):
-                temp_pose[i * 30 + j] = ((30-j) * params['pose'][i*30] + j*params['pose'][i*30 + 30]) / 30.0
-        params['pose'] = torch.nn.Parameter(temp_pose, requires_grad=True) 
+        # # smooth poses by interpolating every 5 frame
+        # temp_pose = params['pose'].detach().clone()
+        # # for i in range(params['pose'].shape[0] // 30 - 1):
+        # #     for j in range(30):
+        # #         temp_pose[i * 30 + j] = ((30-j) * params['pose'][i*30] + j*params['pose'][i*30 + 30]) / 30.0
+        # params['pose'] = torch.nn.Parameter(temp_pose, requires_grad=True) 
 
-        # temp_trans = params['trans'].detach().clone()
-        temp_trans = torch.zeros_like(params['trans']) + params['trans'].mean(0)
-        params['trans'] = torch.nn.Parameter(temp_trans, requires_grad=True) 
+        # # temp_trans = params['trans'].detach().clone()
+        # temp_trans = torch.zeros_like(params['trans']) + params['trans'].mean(0)
+        # params['trans'] = torch.nn.Parameter(temp_trans, requires_grad=True) 
 
-        # temp_rot = params['rot'].detach().clone()
-        temp_rot = torch.zeros_like(params['rot']) + params['rot'].mean(0)
-        params['rot'] = torch.nn.Parameter(temp_rot, requires_grad=True)
+        # # temp_rot = params['rot'].detach().clone()
+        # temp_rot = torch.zeros_like(params['rot']) + params['rot'].mean(0)
+        # params['rot'] = torch.nn.Parameter(temp_rot, requires_grad=True)
 
-        if not 'wrist_pose' in params:
-            params['wrist_pose'] = torch.nn.Parameter(torch.zeros([params['pose'].shape[0], 3]), requires_grad=True)
-        # Ambient to diffuse ratio
-        if not 'amb_ratio' in params:
-            params['amb_ratio'] = torch.nn.Parameter(torch.tensor(0.4), requires_grad=True)  # Roughly 0.6 after sigmoid
+        # if not 'wrist_pose' in params:
+        #     params['wrist_pose'] = torch.nn.Parameter(torch.zeros([params['pose'].shape[0], 3]), requires_grad=True)
+        # # Ambient to diffuse ratio
+        # if not 'amb_ratio' in params:
+        #     params['amb_ratio'] = torch.nn.Parameter(torch.tensor(0.4), requires_grad=True)  # Roughly 0.6 after sigmoid
 
-        if not "normal_map" in params:
-            params["normal_map"] =  torch.nn.Parameter(torch.tensor([0.0, 0.0, 1.0]).repeat(1, 512, 512, 1), requires_grad=True)
+        # if not "normal_map" in params:
+        #     params["normal_map"] =  torch.nn.Parameter(torch.tensor([0.0, 0.0, 1.0]).repeat(1, 512, 512, 1), requires_grad=True)
+        
+        params['mano_faces'] = mano_faces.to(device)
         
     else:
         params = init_params(input_params, VERT_DISPS, VERT_DISPS_NORMALS, VERTS_COLOR,  mano_faces, use_verts_textures, 
                     VERTS_UVS, FACES_UVS, model_type=configs["model_type"], use_arm=configs["use_arm"], configs=configs, device=device)
     # NOTE:New for hand_nerf: init transform from world to camera into params
-    params=params_cam2transform(params,configs,device=device)                                                               
-    
+    params=params_cam2transform(params,configs,device=device)       
+
+    if TEST_VAL:                                                        
+        val_params=init_params(val_params, VERT_DISPS, VERT_DISPS_NORMALS, VERTS_COLOR,  mano_faces, use_verts_textures, 
+                        VERTS_UVS, FACES_UVS, model_type=configs["model_type"], use_arm=configs["use_arm"], configs=configs, device=device)
+        # val_params=params
+        val_params=params_cam2transform(val_params,configs,device=device)
+
     #### End initialization ####
 
     batch_size = 1 # 19 # 10 # 30 # 2 # 16
@@ -837,6 +963,7 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
     
     images_dataloader = DataLoader(images_dataset, batch_size=batch_size, shuffle=True, num_workers=20)
     val_images_dataloader = DataLoader(val_images_dataset, batch_size=val_batch, shuffle=True, num_workers=20)  # Shuffle val
+    # val_images_dataloader =DataLoader(images_dataset, batch_size=val_batch, shuffle=True, num_workers=20)
 
     ### Define loss and optimizer
     l1_loss = torch.nn.L1Loss()
@@ -863,14 +990,18 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
             'rgb':         {"weight": 1.0, "values": []}, # 1.0 ## 1.0
             'acc_0':         {"weight": 0.001, "values": []}, 
             'acc':         {"weight": 0.001, "values": []},
-            'sparsity_reg':  {"weight": 0.01, "values": []},
-            'sparsity_reg_0':  {"weight": 0.01, "values": []},
+            'sparsity_reg':  {"weight": 0.1, "values": []},
+            'sparsity_reg_0':  {"weight": 0.1, "values": []},
             'smpl_reg':      {"weight": 0.1, "values": []},
             'smpl_reg_0':      {"weight": 0.1, "values": []},
             'smpl_reg_dummy':      {"weight": 0.1, "values": []},
             'smpl_reg_dummy_0':      {"weight": 0.1, "values": []},
             'lpips':         {"weight": 0.1, "values": []},
             'lpips_0':         {"weight": 0.1, "values": []},
+            'adv_gen':         {"weight": 1., "values": []},
+            'adv_gen_0':         {"weight": 1., "values": []},
+            'adv_dis':         {"weight": 1., "values": []},
+            'adv_dis_0':         {"weight": 1., "values": []},
 
             # 'acc_0':         {"weight": 0., "values": []}, 
             # 'acc':         {"weight": 0., "values": []},
@@ -882,6 +1013,11 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
             # 'smpl_reg_dummy_0':      {"weight": 0., "values": []},
             # 'lpips':         {"weight": 0., "values": []},
             # 'lpips_0':         {"weight": 0., "values": []},
+            # 'adv_gen':         {"weight": 0., "values": []},
+            # 'adv_gen_0':         {"weight": 0., "values": []},
+            # 'adv_dis':         {"weight": 0., "values": []},
+            # 'adv_dis_0':         {"weight": 0., "values": []},
+            
          }
     # torch.autograd.set_detect_anomaly(True)
 
@@ -893,15 +1029,36 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf_tcnn(
             args)   
     
-    # set lr of optimizer to be 0.005
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = 0.005
+    # # set lr of optimizer to be 0.005
+    # for param_group in optimizer.param_groups:
+    #     param_group['lr'] = 0.005
 
 
-    nerf_scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=2000, gamma=0.9, last_epoch=-1)
+    nerf_scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.9, last_epoch=-1)
+
+    if ADVERSARIAL:
+        assert PATCH, 'ADVERSARIAL must be used with PATCH'
+        discriminator=Discriminator().to(device)
+        discriminator_optimizer=torch.optim.Adam(discriminator.parameters(),lr=0.001)
+        discriminator_scheduler=torch.optim.lr_scheduler.StepLR(discriminator_optimizer, step_size=2000, gamma=0.9, last_epoch=-1)
+        ckpts = [os.path.join(args.basedir, args.expname, f) for f in sorted(os.listdir(os.path.join(args.basedir, args.expname))) if
+                'tar' in f]
+        if len(ckpts) > 0:
+            ckpt_path = ckpts[-1]
+            print('Reloading from', ckpt_path)
+            ckpt = torch.load(ckpt_path)
+            if 'discriminator' in ckpt:
+                discriminator.load_state_dict(ckpt['discriminator_state_dict'])
+                discriminator_optimizer.load_state_dict(ckpt['discriminator_optimizer_state_dict'])
+
+            for param in discriminator.parameters():
+                param['lr'] = 0.001
+            
 
     # debug_ray_point_and_mesh(params,hand_layer,configs,mesh_subdivider)
     H=W=configs['img_size']
+
+
 
     
     # Get reference mesh. Use the mesh from the first frame.
@@ -912,14 +1069,32 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
         hand_joints, hand_verts, faces, textures, hand_dict = prepare_mesh_NeRF(params, torch.tensor([fid]), hand_layer, use_verts_textures, mesh_subdivider, 
         global_pose=GLOBAL_POSE, configs=configs, shared_texture=SHARED_TEXTURE, use_arm=configs['use_arm'], device=device)
         ref_meshes = Meshes(hand_verts, faces, textures)
-        canonical_coor_normalizer=CoordinateTransformer(hand_dict['v_shaped'].squeeze(),scale=0.8)
+        scale=0.8
+        canonical_coor_normalizer=CoordinateTransformer(hand_dict['v_shaped'].squeeze(),scale=scale)
+        canonical_r=canonical_coor_normalizer.scale_factor*(hand_verts.squeeze().mean(0)-torch.linalg.inv(params['w2c'][fid]).squeeze()[:3,3]).norm()
+    
+    if DEBUG:
+        # canonical space里，-x轴朝上，手掌心朝向-y
+        phi=torch.rand(1)*np.pi # 与-x的夹角
+        theta=torch.rand(1)*np.pi*2 #与-y的夹角
 
+        x=-torch.cos(phi)*canonical_r
+        y=-torch.sin(phi)*torch.cos(theta)*canonical_r
+        z=torch.sin(phi)*torch.sin(theta)*canonical_r
+        origin=torch.concat([x,y,z],dim=0)
+        look_at=(torch.rand((3))*2-1)*scale
+        forward_vector=look_at-origin
+        c2w_canonical=create_cam2world_matrix(forward_vector.unsqueeze(0).to(device),origin.unsqueeze(0).to(device),device)
+        rays_o_canonical,rays_d_canonical=get_rays(H,W,configs['focal_length'],c2w_canonical.squeeze())
+
+        pass
+        
 
     ### Training Loop ###
     epoch_id = 0
     n_iter = 0
     global_step=start
-    epoch_start=start%(len(images_dataloader))
+    epoch_start=start//(len(images_dataloader))
 
     PATCH_ORIGINAL=PATCH
     N_rand_original=args.N_rand
@@ -932,602 +1107,624 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
         mini_batch_count = 0
         # set process bar indicating image_dataloader
         bar=tqdm(total=len(images_dataloader),desc='Image:')
-        for (fid, y_true, y_sil_true, y_sil_true_ero, y_sil_true_dil) in images_dataloader:
-            bar.update(1)
-            if TIME: t0 = time.time()
-            cur_batch_size = fid.shape[0]
-            y_sil_true = y_sil_true.squeeze(-1).to(device)
-            y_sil_true_ero = y_sil_true_ero.squeeze(-1).to(device)
-            y_sil_true_dil = y_sil_true_dil.squeeze(-1).to(device)
-            y_true = y_true.to(device)
-            if TIME:
-                t1 = time.time()
-                print(f't0-t1--preparing data:{t1-t0}')
-            # Get new shader with updated light position
-            if configs["share_light_position"]:
-                light_positions = params['light_positions'][0].repeat(cur_batch_size, 1)
-            else:
-                light_positions = params['light_positions'][fid]
-            # phong_renderer, silhouette_renderer, normal_renderer = renderer_helper.get_renderers(image_size=img_size, 
-            #     light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, device=device)
-            if TIME:
-                t2=time.time()
-                print(f't1-t2--get renderer:{t2-t1}')
-            # Meshes
-            hand_joints, hand_verts, faces, textures, hand_dict = prepare_mesh_NeRF(params, fid, hand_layer, use_verts_textures, mesh_subdivider,
-                global_pose=GLOBAL_POSE, configs=configs, shared_texture=SHARED_TEXTURE, device=device, use_arm=configs['use_arm'])
-            meshes = Meshes(hand_verts, faces, textures)
-            cam = params['cam'][fid]
-            if TIME:
-                t3=time.time()
-                print(f't2-t3--prepare mesh:{t3-t2}')
-
-            # Material properties
-            # materials_properties = prepare_materials(params, fid.shape[0])
-
-            if TIME:
-                t4=time.time()
-                print(f't3-t4--prepare materials:{t4-t3}')
+        if epoch_id < configs["training_stage"][0]:
+            COARSE_OPT = True
+            APP_OPT    = False
             
-            #NOTE:New for hand_nerf: get rays in world frame
-
-            coords = torch.stack(torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W)),
-                                        -1)  # (H, W, 2)
-            coords = torch.reshape(coords, [-1, 2]) 
-            rays_o, rays_d = get_rays(H, W, configs['focal_length'], torch.linalg.inv(params['w2c'][fid]).squeeze())
-            rays_o_reshape = rays_o.reshape(-1, 3)
-            rays_d_reshape = rays_d.reshape(-1, 3)
-            if PATCH_ORIGINAL:
-                args.N_rand=N_rand_original
-                PATCH=mini_batch_count%3==0
-            else:
-                PATCH=False
-
-            if TIME:
-                t5=time.time()
-                print(f't4-t5--get rays:{t5-t4}')
-            if True:
-                if not PATCH:
-                    # 当不使用PATCH时，随机sampled的点是扩大后的mask
-                    # use img mask as start
-                    hit_mask=(y_sil_true_dil>0.).reshape(-1)
-                    hit_mask_idx=torch.where((y_sil_true_dil>0.).reshape(-1))[0]
-                    # choose 2*args.N_rand rays using randperm
-                    hit_mask_choose_idx=hit_mask_idx[torch.randperm(hit_mask.sum())[:int(1.5*args.N_rand)]] if not DEBUG else hit_mask_idx[torch.arange(hit_mask.sum())]
-                    hit_mask_choose_mask=torch.zeros_like(hit_mask)
-                    hit_mask_choose_mask[hit_mask_choose_idx]=1
-                    hit_mask=hit_mask*hit_mask_choose_mask # shape (H*W)
-                    rays_o_reshape=rays_o_reshape[hit_mask] # shape (int(1.5*args.N_rand),3)
-                    rays_d_reshape=rays_d_reshape[hit_mask] # shape (int(1.5*args.N_rand),3)
-                    near, far = geometry_guided_near_far_torch(rays_o_reshape, 
-                                                               rays_d_reshape/rays_d_reshape.norm(dim=-1,keepdim=True), 
-                                                               hand_verts.squeeze(),geo_threshold=0.005) 
-                    hit_mask_near_far=(near < far) # shape (int(1.5*args.N_rand))
-                else:
-                    # 当使用PATCH时，随机sample的点是缩小的的mask
-                    args.N_rand=PATCH_SIZE**2
-                    near=torch.ones(1)
-                    while len(near)<args.N_rand:
-                        hit_mask=(y_sil_true_ero>0.).squeeze(0) # shape (H,W)
-                        patch_mask=sample_patch(hit_mask,patch_size=PATCH_SIZE)
-                        hit_mask=patch_mask.reshape(-1)
-                        rays_o_reshape_=rays_o_reshape[hit_mask]
-                        rays_d_reshape_=rays_d_reshape[hit_mask]
-                        near, far = geometry_guided_near_far_torch(rays_o_reshape_, 
-                                                                   rays_d_reshape_/rays_d_reshape_.norm(dim=-1,keepdim=True), 
-                                                                   hand_verts.squeeze(),geo_threshold=0.005)
-                        if len(near)<args.N_rand or (near<far).sum()<1:
-                            continue
-                        near[torch.where(near>far)[0]]=near[near<far].mean()-0.01
-                        far[torch.where(near>far)[0]]=far[near<far].mean()+0.01
-                        hit_mask_near_far=(near < far)
-                    rays_o_reshape = rays_o_reshape_
-                    rays_d_reshape = rays_d_reshape_
+        elif epoch_id < configs["training_stage"][0] + configs["training_stage"][1]:
+            COARSE_OPT = True
+            APP_OPT    = True
+        else:
+            COARSE_OPT = False
+            APP_OPT    = True
+        for param in optimizer.param_groups[0]['params']:
+            param.requires_grad=APP_OPT
+        for param in opt_coarse.param_groups[0]['params']:
+            param.requires_grad=COARSE_OPT
+        if not ONLY_TEST:
+            for (fid, y_true, y_sil_true, y_sil_true_ero, y_sil_true_dil) in images_dataloader:
+                bar.update(1)
+                if TIME: t0 = time.time()
+                cur_batch_size = fid.shape[0]
+                y_sil_true = y_sil_true.squeeze(-1).to(device)
+                y_sil_true_ero = y_sil_true_ero.squeeze(-1).to(device)
+                y_sil_true_dil = y_sil_true_dil.squeeze(-1).to(device)
+                y_true = y_true.to(device)
                 if TIME:
-                    t6=time.time()
-                    print(f't5-t6--get near far:{t6-t5}')
-                
-            else:
-                near, far = geometry_guided_near_far_torch_dummy(rays_o_reshape, rays_d_reshape, hand_joints.squeeze(),geo_threshold=0.008)
-                hit_mask=(y_sil_true_ero>0.).reshape(-1)
-                hit_mask_near_far=(near < far)
+                    t1 = time.time()
+                    print(f't0-t1--preparing data:{t1-t0}')
+                # Get new shader with updated light position
+                if configs["share_light_position"]:
+                    light_positions = params['light_positions'][0].repeat(cur_batch_size, 1)
+                else:
+                    light_positions = params['light_positions'][fid]
+                if COARSE_OPT:
+                    phong_renderer, silhouette_renderer, normal_renderer = renderer_helper.get_renderers(image_size=img_size, 
+                        light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, device=device)
                 if TIME:
-                    t6=time.time()
-                    print(f't5-t6--get near far:{t6-t5}')
-            # near=torch.zeros_like(near)
-            try:
-                near = near[hit_mask_near_far]
-                far = far[hit_mask_near_far]
-                rays_o_reshape = rays_o_reshape[hit_mask_near_far]
-                rays_d_reshape = rays_d_reshape[hit_mask_near_far]
-            except:
-                # report near,far,rays_o_reshape,rays_d_reshape's shape and hit_mask_near_far's shape and sum
-                print('index error')
-                print(f'hit_mask_near_far.shape:{hit_mask_near_far.shape}')
-                print(f'hit_mask_near_far.sum():{hit_mask_near_far.sum()}')
-                print(f'near.shape:{near.shape}')
-                print(f'far.shape:{far.shape}')
-                print(f'rays_o_reshape.shape:{rays_o_reshape.shape}')
-                print(f'rays_d_reshape.shape:{rays_d_reshape.shape}')
-                continue
-            # reshape hit_mask into (H, W)
-            hit_mask = hit_mask.reshape(H, W)
+                    t2=time.time()
+                    print(f't1-t2--get renderer:{t2-t1}')
+                # Meshes
+                hand_joints, hand_verts, faces, textures, hand_dict = prepare_mesh_NeRF(params, fid, hand_layer, use_verts_textures, mesh_subdivider,
+                    global_pose=GLOBAL_POSE, configs=configs, shared_texture=SHARED_TEXTURE, device=device, use_arm=configs['use_arm'])
+                meshes = Meshes(hand_verts, faces, textures)
+                cam = params['cam'][fid]
+                if TIME:
+                    t3=time.time()
+                    print(f't2-t3--prepare mesh:{t3-t2}')
+                loss = {}
+                if COARSE_OPT: 
+                    y_sil_pred = render_image(meshes, cam, cur_batch_size, silhouette_renderer, configs['img_size'], configs['focal_length'], silhouette=True)
+                    loss["silhouette"] = l1_loss(y_sil_true, y_sil_pred)
+                    
+                    # Keypoint anchor
+                    # Anchor keypoints to the initial prediction
+                    if not configs["known_appearance"] and not configs["model_type"] == "nimble":
+                        loss["kps_anchor"] = kps_loss(params['init_joints'][fid], hand_joints, use_arm=configs['use_arm'])
+                        if torch.isnan(loss["kps_anchor"]):
+                            loss["kps_anchor"]=torch.tensor(0.).mean()
 
-            # choose args.N_rand rays using randperm
-            rand_idx = torch.randperm(rays_o_reshape.shape[0])[:args.N_rand] 
-            if DEBUG or PATCH:
-                rand_idx=torch.arange(rays_o_reshape.shape[0])
-            rays_o_reshape = rays_o_reshape[rand_idx]
-            rays_d_reshape = rays_d_reshape[rand_idx]
-            near = near[rand_idx]
-            far = far[rand_idx]
-            # get points between near and far with args.N_samples intervals
-            t_vals = torch.linspace(0., 1., steps=args.N_samples, device=device)
-            # expand
-            z_vals = near[..., None] * (1. - t_vals[None, ...]) + far[..., None] * (t_vals[None, ...]) # (N_rays, N_samples)
-
-            if near.shape[0] < 100:
-                raise Exception('too few rays, please check the camera pose')
-
-            if args.perturb > 0.:
-                # get intervals between samples
-                mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-                upper = torch.cat([mids, z_vals[..., -1:]], -1)
-                lower = torch.cat([z_vals[..., :1], mids], -1)
-                # stratified samples in those intervals
-                t_rand = torch.rand(z_vals.shape).to(device)
-                z_vals = lower + (upper - lower) * t_rand
-
-            pts = rays_o_reshape[..., None, :] + rays_d_reshape[..., None, :] * z_vals[..., :, None] # (N_rays, N_samples, 3)
-
-            pts=pts.reshape(1,-1,3)
-            pts_np=pts.reshape(-1,3).detach().cpu().numpy()
-            verts_np=hand_verts.reshape(-1,3).detach().cpu().numpy()
-            faces_np=faces.detach().cpu().numpy().squeeze(0)
-
-            if TIME:
-                t7=time.time()
-                print(f't6-t7--get pts:{t7-t6}')
-
-            if DEBUG:
-                # 检查世界系下的点和手部顶点是否对齐
-                pts_save=pts.clone().detach().reshape(-1,3).cpu().numpy()
-                pts_save=pts_save
-                hand_verts_save=hand_verts.detach().reshape(-1,3).cpu().numpy()
-                save_points(pts_save,hand_verts_save,'pts_world_vs_handverts_world.ply')
-
-            # test_pts_w2canonical(hand_verts,faces,verts_np,faces_np,hand_dict)
-            try:
-                pts,ret_dict_warp=pts_w2canonical(pts,hand_verts,faces,pts_np,verts_np,faces_np,hand_dict,return_dict=True)
-            except:
-                print('pts_w2canonical error')
-                continue
-            signed_dist_0=ret_dict_warp['signed_dist']
-            
-            near_min=near.min().item()
-            far_max=far.max().item()
-
-            if DEBUG:
-                # 检查规范化后的手部顶点和手部顶点是否对齐
-                hand_verts_canonicalize=pts_w2canonical(hand_verts,hand_verts,faces,
-                                                     hand_verts.reshape(-1,3).detach().cpu().numpy(),
-                                                     verts_np,faces_np,hand_dict)
-                hand_verts_canonicalize_save=hand_verts_canonicalize.detach().reshape(-1,3).cpu().numpy()
-                hand_verts_shaped_save=hand_dict['v_shaped'].detach().reshape(-1,3).cpu().numpy()
-                save_points(hand_verts_canonicalize_save,hand_verts_shaped_save,'hand_verts_canonicalize_vs_hand_verts_shaped.ply')
-
-            if DEBUG:
-                # 检查规范化后的点和规范化前的点是否对齐
-                pts_save=pts.clone().detach().reshape(-1,3).cpu().numpy()
-                pts_save=pts_save
-                pts_save_before_canonical_normalize=pts_save.copy()
-                hand_verts_save=hand_dict['v_shaped'].detach().reshape(-1,3).cpu().numpy()
-                save_points(pts_save,hand_verts_save,'pts_after_canonical_vs_handverts_shaped.ply')
-                
-            pts=canonical_coor_normalizer(pts)
-
-            if DEBUG:
-                # 检查正则化后的点和规范化后的点是否对齐
-                pts_save=pts.clone().detach().reshape(-1,3).cpu().numpy()
-                pts_save=pts_save
-                hand_verts_save=pts_save_before_canonical_normalize
-                save_points(pts_save,hand_verts_save,'pts_normalized_vs_pts_after_canonical.ply')
-
-            if DEBUG:
-                # 检查正则化后的点和bbox是否对齐
-                hand_verts_shaped_normalize=canonical_coor_normalizer(hand_dict['v_shaped'].detach().reshape(-1,3)).detach().reshape(-1,3).cpu().numpy()
-                # bbox at eight points [-1,-1,-1],[1,-1,-1],[-1,1,-1],[1,1,-1],[-1,-1,1],[1,-1,1],[-1,1,1],[1,1,1]
-                bbox=np.array([[-1,-1,-1],[1,-1,-1],[-1,1,-1],[1,1,-1],[-1,-1,1],[1,-1,1],[-1,1,1],[1,1,1]])
-                save_points(hand_verts_shaped_normalize,bbox,'hand_verts_shaped_normalized_vs_bbox.ply')
-            
-            pts=pts.reshape(args.N_rand,-1,3)
-
-            if TIME:
-                t8=time.time()
-                print(f't7-t8--warp pts:{t8-t7}')
-
-            all_ret_0=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals,retraw=True, **render_kwargs_train)
-
-            if TIME:
-                t9=time.time()
-                print(f't8-t9--first render rays:{t9-t8}')
-            rgb_map_0, disp_map_0, acc_map_0,weights_0 = all_ret_0['rgb_map'], all_ret_0['disp_map'], all_ret_0['acc_map'], all_ret_0['weights']
-            alpha_0=all_ret_0['alpha'] if 'alpha' in all_ret_0 else None
-
-            z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
-            z_samples = sample_pdf(
-                z_vals_mid, weights_0[..., 1:-1], args.N_importance, det=(args.perturb == 0.))
-            z_samples = z_samples.detach()
-
-            z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
-            pts = rays_o_reshape[..., None, :] + rays_d_reshape[..., None, :] * z_vals[..., :,
-                                                                       None]  # [N_rays, N_samples + N_importance, 3]
-
-            pts=pts.reshape(1,-1,3)
-            pts_np=pts.reshape(-1,3).detach().cpu().numpy()
-            if TIME:
-                t10=time.time()
-                print(f't9-t10--sample pdf:{t10-t9}')
-
-            # test_pts_w2canonical(hand_verts,faces,verts_np,faces_np,hand_dict)
-            pts,ret_dict_warp=pts_w2canonical(pts,hand_verts,faces,pts_np,verts_np,faces_np,hand_dict,return_dict=True)
-            signed_dist=ret_dict_warp['signed_dist']
-            pts=canonical_coor_normalizer(pts)
-
-            pts=pts.reshape(args.N_rand,-1,3)
-            if TIME:
-                t11=time.time()
-                print(f't10-t11--warp pts:{t11-t10}')
-
-            all_ret=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals,retraw=True,fine_stage=True, **render_kwargs_train)
-
-            if TIME:
-                t12=time.time()
-                print(f't11-t12--second render rays:{t12-t11}')
-            y_gt_choose=y_true.squeeze(0)[hit_mask][hit_mask_near_far][rand_idx]
-
-            rgb_map, disp_map, acc_map, weights = all_ret['rgb_map'], all_ret['disp_map'], all_ret['acc_map'], all_ret['weights']
-
-            y_sil_true_choose=y_sil_true.squeeze(0)[hit_mask][hit_mask_near_far][rand_idx]
-
-    
-
-            # # Shihouette
-            # # Stop computing and updating silhouette when learning texture model
-            # y_sil_pred = render_image(meshes, cam, cur_batch_size, silhouette_renderer, configs['img_size'], configs['focal_length'], silhouette=True)
-            
-            # # RGB UV
-            # if configs["self_shadow"]:
-            #     # Render with self-shadow
-            #     light_R, light_T, cam_R, cam_T = renderer_helper.process_info_for_shadow(cam, light_positions, hand_verts.mean(1), 
-            #                                         image_size=configs['img_size'], focal_length=configs['focal_length'])
-            #     shadow_renderer = renderer_helper.get_shadow_renderers(image_size=img_size, 
-            #         light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, 
-            #         amb_ratio=nn.Sigmoid()(params['amb_ratio']), device=device)
-
-            #     y_pred = render_image_with_RT(meshes, light_T, light_R, cam_T, cam_R,
-            #                 cur_batch_size, shadow_renderer, configs['img_size'], configs['focal_length'], silhouette=False, 
-            #                 materials_properties=materials_properties)
-            # else:
-            #     # Render without self-shadow
-            #     y_pred = render_image(meshes, cam, cur_batch_size, phong_renderer, configs['img_size'], configs['focal_length'], 
-            #                           silhouette=False, materials_properties=materials_properties)
-
-            # if LOG_IMGAGE and epoch_id % 10 == 0 and mini_batch_count == 0:
-            #     # Value range 0 (black) -> 1 (white)
-            #     # Log silhouette
-            #     show_img_pair(y_sil_pred.detach().cpu().numpy(), y_sil_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
-            #             step=epoch_id, silhouette=True, prefix="")
-            #     # Log RGB
-            #     show_img_pair(y_pred.detach().cpu().numpy(), y_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
-            #             step=epoch_id, silhouette=False, prefix="")
-            #     # Loss visulization
-            #     loss_image = torch.abs(y_true * y_sil_true_col.unsqueeze(-1) - y_pred * y_sil_true_col.unsqueeze(-1))
-            #     show_img_pair(loss_image.detach().cpu().numpy(), y_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
-            #             step=epoch_id, silhouette=False, prefix="loss_")
-            
-
-            loss = {}
-
-            # NOTE:New for hand_nerf: get rgb loss
-            loss_rgb = ((rgb_map-y_gt_choose)**2).mean()
-            loss_rgb_0 = ((rgb_map_0-y_gt_choose)**2).mean()
-            loss['rgb_0'] = loss_rgb_0
-            loss['rgb'] = loss_rgb
-
-            if losses['acc']['weight'] > 0.:
-                loss['acc']=((acc_map-y_sil_true_choose)**2).mean()
-                loss['acc_0']=((acc_map_0-y_sil_true_choose)**2).mean()
-            else:
-                loss['acc']=torch.tensor(0.0, device=device)
-                loss['acc_0']=torch.tensor(0.0, device=device)
-
-            if losses['sparsity_reg']['weight'] > 0.:
-                sparsity_reg = torch.mean(-torch.log(
-                    torch.exp(-torch.abs(acc_map.clamp(0.,1.))) + torch.exp(-torch.abs(1-acc_map.clamp(0.,1.)))
-                + 1e-5) + HARD_SURFACE_OFFSET)
-
-                sparsity_reg=sparsity_reg+torch.mean(-torch.log(
-                    torch.exp(-torch.abs(weights.clamp(0.,1.))) + torch.exp(-torch.abs(1-weights.clamp(0.,1.)))
-                + 1e-5) + HARD_SURFACE_OFFSET)
-
-                loss['sparsity_reg']=sparsity_reg
-
-                sparsity_reg_0=torch.mean(-torch.log(
-                    torch.exp(-torch.abs(acc_map_0.clamp(0.,1.))) + torch.exp(-torch.abs(1-acc_map_0.clamp(0.,1.)))
-                + 1e-5) + HARD_SURFACE_OFFSET)
-
-                sparsity_reg_0=sparsity_reg_0+torch.mean(-torch.log(
-                    torch.exp(-torch.abs(weights_0.clamp(0.,1.))) + torch.exp(-torch.abs(1-weights_0.clamp(0.,1.)))
-                + 1e-5) + HARD_SURFACE_OFFSET)
-
-                loss['sparsity_reg_0']=sparsity_reg_0
-            else:
-                loss['sparsity_reg']=torch.tensor(0.0, device=device)
-                loss['sparsity_reg_0']=torch.tensor(0.0, device=device)
-
-            if losses['smpl_reg']['weight'] > 0.:
-
-                inside_volume = signed_dist< 0
-                raw_inside_volume = all_ret['raw'].reshape(-1, 4)[inside_volume]
-                if inside_volume.sum() > 0:
-                    smpl_reg =  F.mse_loss(
-                        1 - torch.exp(-torch.relu(raw_inside_volume[:, 3])),
-                        torch.ones_like(raw_inside_volume[:, 3])
-                    ) 
-                else:
-                    smpl_reg = torch.tensor(0.0, device=device)
-                loss['smpl_reg'] = smpl_reg
-
-                inside_volume_0 = signed_dist_0< 0
-                raw_inside_volume_0 = all_ret_0['raw'].reshape(-1, 4)[inside_volume_0]
-                if inside_volume_0.sum() > 0:
-                    smpl_reg_0 =  F.mse_loss(
-                        1 - torch.exp(-torch.relu(raw_inside_volume_0[:, 3])),
-                        torch.ones_like(raw_inside_volume_0[:, 3])
-                    ) 
-                else:
-                    smpl_reg_0 = torch.tensor(0.0, device=device)
-                loss['smpl_reg_0'] = smpl_reg_0
-            else:
-                loss['smpl_reg']=torch.tensor(0.0, device=device)
-                loss['smpl_reg_0']=torch.tensor(0.0, device=device)
-
-            if SMLP_REG_DUMMY and losses['smpl_reg_dummy']['weight'] > 0. and np.random.rand()<0.5:
-                pts_dummy=torch.rand_like(pts)*2-1
-                raw_smpl=render_kwargs_train['network_query_fn'](pts, None, render_kwargs_train['network_fn'])
-                v_shaped_canonical_normalize=canonical_coor_normalizer(hand_dict['v_shaped'].detach().reshape(-1,3),clamp=False).detach().reshape(-1,3)
-                mesh_v_shaped_canonical_normalize=Meshes(v_shaped_canonical_normalize.unsqueeze(0),params['mesh_faces'].unsqueeze(0))
-                mesh_v_shaped_canonical_normalize=mesh_subdivider(mesh_v_shaped_canonical_normalize)
-                # Meshes(v_shaped_canonical_normalize.unsqueeze(0),faces.unsqueeze(0))
-                signed_dist_smpl_dummy,_,_=igl.signed_distance(pts_dummy.reshape(-1,3).detach().cpu().numpy(), 
-                                                               mesh_v_shaped_canonical_normalize.verts_packed().squeeze(0).cpu().numpy(), 
-                                                               mesh_v_shaped_canonical_normalize.faces_packed().squeeze(0).cpu().numpy())
-                if DEBUG:
-                    mask=torch.from_numpy(signed_dist_smpl_dummy).to(device)
-                    mask=(mask<0.001)*(mask>-0.001)
-                    pts_dummy_save=(pts_dummy.clone().detach().reshape(-1,3)[mask]).cpu().numpy()
-                    hand_verts_save=mesh_v_shaped_canonical_normalize.verts_packed().squeeze(0).cpu().numpy()
-                    save_points(pts_dummy_save,hand_verts_save,'pts_dummy_vs_hand_verts.ply')
-
-
-                inside_volume_smpl_dummy = signed_dist_smpl_dummy< 0
-                raw_inside_volume_smpl_dummy = raw_smpl.reshape(-1, 4)[inside_volume_smpl_dummy]
-                raw_outside_volume_smpl_dummy = raw_smpl.reshape(-1, 4)[~inside_volume_smpl_dummy]
-
-                if DEBUG:
-                    mask=inside_volume_smpl_dummy
-                    pts_dummy_save=(pts_dummy.clone().detach().reshape(-1,3)[mask]).cpu().numpy()
-                    hand_verts_save=mesh_v_shaped_canonical_normalize.verts_packed().squeeze(0).cpu().numpy()
-                    save_points(pts_dummy_save,hand_verts_save,'pts_inside_vs_hand_verts.ply')
-
-
-                if inside_volume_smpl_dummy.sum() > 0:
-                    smpl_reg_dummy =  F.mse_loss(
-                        1 - torch.exp(-torch.relu(raw_inside_volume_smpl_dummy[:, 3])),
-                        torch.ones_like(raw_inside_volume_smpl_dummy[:, 3])
-                    )
-                else:
-                    smpl_reg_dummy = torch.tensor(0.0, device=device)
-                if ~inside_volume_smpl_dummy.sum() > 0:
-                    smpl_reg_dummy = smpl_reg_dummy + F.mse_loss(
-                        torch.exp(-torch.relu(raw_outside_volume_smpl_dummy[:, 3])),
-                        torch.ones_like(raw_outside_volume_smpl_dummy[:, 3])
-                    )
-                loss['smpl_reg_dummy'] = smpl_reg_dummy
-
-                raw_smpl_0=render_kwargs_train['network_query_fn'](pts, None, render_kwargs_train['network_fine'])
-                if inside_volume_smpl_dummy.sum() > 0:
-                    smpl_reg_dummy_0 =  F.mse_loss(
-                        1 - torch.exp(-torch.relu(raw_inside_volume_smpl_dummy[:, 3])),
-                        torch.ones_like(raw_inside_volume_smpl_dummy[:, 3])
-                    )
-                else:
-                    smpl_reg_dummy_0 = torch.tensor(0.0, device=device)
-                if ~inside_volume_smpl_dummy.sum() > 0:
-                    smpl_reg_dummy_0 = smpl_reg_dummy_0 + F.mse_loss(
-                        torch.exp(-torch.relu(raw_outside_volume_smpl_dummy[:, 3])),
-                        torch.ones_like(raw_outside_volume_smpl_dummy[:, 3])
-                    )
-                loss['smpl_reg_dummy_0'] = smpl_reg_dummy_0
-            else:
-                loss['smpl_reg_dummy']=torch.tensor(0.0, device=device)
-                loss['smpl_reg_dummy_0']=torch.tensor(0.0, device=device)
-            
-            if losses['lpips']['weight'] > 0. and PATCH:
-                # reshape rgb_map and y_true to (1,PATCH_SIZE,PATCH_SIZE,3)
-                rgb_map_lpips=rgb_map.reshape(1,PATCH_SIZE,PATCH_SIZE,3)
-                y_gt_choose_lpips=y_gt_choose.reshape(1,PATCH_SIZE,PATCH_SIZE,3)
-                rgb_map_lpips=rgb_map_lpips.permute(0,3,1,2)
-                y_gt_choose_lpips=y_gt_choose_lpips.permute(0,3,1,2)
-                loss['lpips']=lpips_fn(rgb_map_lpips,y_gt_choose_lpips,normalize=True).mean()
-
-                rgb_map_0_lpips=rgb_map_0.reshape(1,PATCH_SIZE,PATCH_SIZE,3).permute(0,3,1,2)
-                loss['lpips_0']=lpips_fn(rgb_map_0_lpips,y_gt_choose_lpips,normalize=True).mean()
-            else:
-                loss['lpips']=torch.tensor(0.0, device=device)
-                loss['lpips_0']=torch.tensor(0.0, device=device)
-
-
-
-            
-
-            """
-            # Check training stage
-            # training stage: [shape only, shape and appearance, appearance]
-            if epoch_id < configs["training_stage"][0]:
-                COARSE_OPT = True
-                APP_OPT    = False
-            elif epoch_id < configs["training_stage"][0] + configs["training_stage"][1]:
-                COARSE_OPT = True
-                APP_OPT    = True
-            else:
-                COARSE_OPT = False
-                APP_OPT    = True
-
-            if COARSE_OPT:
-                # Silhouette only
-                loss["silhouette"] = l1_loss(y_sil_true, y_sil_pred)
-                
-                # Keypoint anchor
-                # Anchor keypoints to the initial prediction
-                if not configs["known_appearance"] and not configs["model_type"] == "nimble":
-                    loss["kps_anchor"] = kps_loss(params['init_joints'][fid], hand_joints, use_arm=configs['use_arm'])
-                    if torch.isnan(loss["kps_anchor"]):
-                        print("Anchor loss is nan")
-                        import pdb; pdb.set_trace()
-
-                # Mesh regularizer
-                # Do not apply mesh loss of test sequence (when appearance is given).
-                if VERT_DISPS and (not configs["known_appearance"]):
-                    if VERT_DISPS_NORMALS:
-                        loss["vert_disp_reg"] = torch.sum(params['verts_disps'] ** 2.0)
+                if TIME:
+                    t4=time.time()
+                    print(f't3-t4--prepare materials:{t4-t3}')
+                if APP_OPT:
+                    #NOTE:New for hand_nerf: get rays in world frame
+                    rays_o, rays_d = get_rays(H, W, configs['focal_length'], torch.linalg.inv(params['w2c'][fid]).squeeze())
+                    rays_o_reshape = rays_o.reshape(-1, 3)
+                    rays_d_reshape = rays_d.reshape(-1, 3)
+                    if PATCH_ORIGINAL:
+                        args.N_rand=N_rand_original
+                        PATCH=mini_batch_count%3==0
                     else:
-                        loss["vert_disp_reg"] = torch.sum(torch.norm(params['verts_disps'], dim=1) ** 2.0)
-                    loss["laplacian"] = mesh_laplacian_smoothing(meshes)
-                    loss["normal"] = mesh_normal_consistency(meshes)
-                    # As rigid as possible compare to the reference mesh (currently use mesh from the first frame)
-                    loss["arap"] = arap_loss(meshes, ref_meshes)
+                        PATCH=False
+
+                    if TIME:
+                        t5=time.time()
+                        print(f't4-t5--get rays:{t5-t4}')
+                    if True:
+                        if not PATCH:
+                            # 当不使用PATCH时，随机sampled的点是扩大后的mask
+                            # use img mask as start
+                            hit_mask=(y_sil_true_dil>0.).reshape(-1)
+                            hit_mask_idx=torch.where((y_sil_true_dil>0.).reshape(-1))[0]
+                            # choose 2*args.N_rand rays using randperm
+                            hit_mask_choose_idx=hit_mask_idx[torch.randperm(hit_mask.sum())[:int(1.5*args.N_rand)]] if not DEBUG else hit_mask_idx[torch.arange(hit_mask.sum())]
+                            hit_mask_choose_mask=torch.zeros_like(hit_mask)
+                            hit_mask_choose_mask[hit_mask_choose_idx]=1
+                            hit_mask=hit_mask*hit_mask_choose_mask # shape (H*W)
+                            rays_o_reshape=rays_o_reshape[hit_mask] # shape (int(1.5*args.N_rand),3)
+                            rays_d_reshape=rays_d_reshape[hit_mask] # shape (int(1.5*args.N_rand),3)
+                            near, far = geometry_guided_near_far_torch(rays_o_reshape, 
+                                                                    rays_d_reshape/rays_d_reshape.norm(dim=-1,keepdim=True), 
+                                                                    hand_verts.squeeze(),geo_threshold=0.005) 
+                            if len(near)<args.N_rand or (near<far).sum()<1:
+                                continue
+                            near[torch.where(near>far)[0]]=near[near<far].mean()-0.01
+                            far[torch.where(near>far)[0]]=far[near<far].mean()+0.01
+                            hit_mask_near_far=(near < far) # shape (int(1.5*args.N_rand))
+                        else:
+                            # 当使用PATCH时，随机sample的点是缩小的的mask
+                            args.N_rand=PATCH_SIZE**2
+                            near=torch.ones(1)
+                            while len(near)<args.N_rand:
+                                hit_mask=(y_sil_true_ero>0.).squeeze(0) # shape (H,W)
+                                patch_mask=sample_patch(hit_mask,patch_size=PATCH_SIZE)
+                                hit_mask=patch_mask.reshape(-1)
+                                rays_o_reshape_=rays_o_reshape[hit_mask]
+                                rays_d_reshape_=rays_d_reshape[hit_mask]
+                                near, far = geometry_guided_near_far_torch(rays_o_reshape_, 
+                                                                        rays_d_reshape_/rays_d_reshape_.norm(dim=-1,keepdim=True), 
+                                                                        hand_verts.squeeze(),geo_threshold=0.005)
+                                if len(near)<args.N_rand or (near<far).sum()<1:
+                                    continue
+                                near[torch.where(near>far)[0]]=near[near<far].mean()-0.01
+                                far[torch.where(near>far)[0]]=far[near<far].mean()+0.01
+                                hit_mask_near_far=(near < far)
+                            rays_o_reshape = rays_o_reshape_
+                            rays_d_reshape = rays_d_reshape_
+                        if TIME:
+                            t6=time.time()
+                            print(f't5-t6--get near far:{t6-t5}')
+                        
+                    else:
+                        near, far = geometry_guided_near_far_torch_dummy(rays_o_reshape, rays_d_reshape, hand_joints.squeeze(),geo_threshold=0.008)
+                        hit_mask=(y_sil_true_ero>0.).reshape(-1)
+                        hit_mask_near_far=(near < far)
+                        if TIME:
+                            t6=time.time()
+                            print(f't5-t6--get near far:{t6-t5}')
+                    # near=torch.zeros_like(near)
+                    try:
+                        near = near[hit_mask_near_far]
+                        far = far[hit_mask_near_far]
+                        rays_o_reshape = rays_o_reshape[hit_mask_near_far]
+                        rays_d_reshape = rays_d_reshape[hit_mask_near_far]
+                    except:
+                        # report near,far,rays_o_reshape,rays_d_reshape's shape and hit_mask_near_far's shape and sum
+                        print('index error')
+                        print(f'hit_mask_near_far.shape:{hit_mask_near_far.shape}')
+                        print(f'hit_mask_near_far.sum():{hit_mask_near_far.sum()}')
+                        print(f'near.shape:{near.shape}')
+                        print(f'far.shape:{far.shape}')
+                        print(f'rays_o_reshape.shape:{rays_o_reshape.shape}')
+                        print(f'rays_d_reshape.shape:{rays_d_reshape.shape}')
+                        continue
+                    # reshape hit_mask into (H, W)
+                    hit_mask = hit_mask.reshape(H, W)
+
+                    # choose args.N_rand rays using randperm
+                    rand_idx = torch.randperm(rays_o_reshape.shape[0])[:args.N_rand] 
+                    if DEBUG or PATCH:
+                        rand_idx=torch.arange(rays_o_reshape.shape[0])
+                    rays_o_reshape = rays_o_reshape[rand_idx]
+                    rays_d_reshape = rays_d_reshape[rand_idx]
+                    near = near[rand_idx]
+                    far = far[rand_idx]
+                    # get points between near and far with args.N_samples intervals
+                    t_vals = torch.linspace(0., 1., steps=args.N_samples, device=device)
+                    # expand
+                    z_vals = near[..., None] * (1. - t_vals[None, ...]) + far[..., None] * (t_vals[None, ...]) # (N_rays, N_samples)
+
+                    if near.shape[0] < 100:
+                        raise Exception('too few rays, please check the camera pose')
+
+                    if args.perturb > 0.:
+                        # get intervals between samples
+                        mids = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+                        upper = torch.cat([mids, z_vals[..., -1:]], -1)
+                        lower = torch.cat([z_vals[..., :1], mids], -1)
+                        # stratified samples in those intervals
+                        t_rand = torch.rand(z_vals.shape).to(device)
+                        z_vals = lower + (upper - lower) * t_rand
+
+                    pts = rays_o_reshape[..., None, :] + rays_d_reshape[..., None, :] * z_vals[..., :, None] # (N_rays, N_samples, 3)
+
+                    pts=pts.reshape(1,-1,3)
+                    pts_np=pts.reshape(-1,3).detach().cpu().numpy()
+                    verts_np=hand_verts.reshape(-1,3).detach().cpu().numpy()
+                    faces_np=faces.detach().cpu().numpy().squeeze(0)
+
+                    if TIME:
+                        t7=time.time()
+                        print(f't6-t7--get pts:{t7-t6}')
+
+                    if DEBUG:
+                        # 检查世界系下的点和手部顶点是否对齐
+                        pts_save=pts.clone().detach().reshape(-1,3).cpu().numpy()
+                        pts_save=pts_save
+                        hand_verts_save=hand_verts.detach().reshape(-1,3).cpu().numpy()
+                        save_points(pts_save,hand_verts_save,'pts_world_vs_handverts_world.ply')
+
+                    # test_pts_w2canonical(hand_verts,faces,verts_np,faces_np,hand_dict)
+                    try:
+                        pts,ret_dict_warp=pts_w2canonical(pts,hand_verts,faces,pts_np,verts_np,faces_np,hand_dict,return_dict=True)
+                    except:
+                        print('pts_w2canonical error')
+                        continue
+                    signed_dist_0=ret_dict_warp['signed_dist']
                 
-            if APP_OPT:
-                # Photometric loss
-                loss["photo"] = l1_loss(y_true * y_sil_true_col.unsqueeze(-1), y_pred * y_sil_true_col.unsqueeze(-1))
 
-                # VGG loss
-                loss["vgg"] = l1_loss(vgg((y_pred * y_sil_true_col.unsqueeze(-1)).permute(0, 3, 1, 2)), 
-                                    vgg((y_true * y_sil_true_col.unsqueeze(-1)).permute(0, 3, 1, 2)))
+                    if DEBUG:
+                        # 检查规范化后的手部顶点和手部顶点是否对齐
+                        hand_verts_canonicalize=pts_w2canonical(hand_verts,hand_verts,faces,
+                                                            hand_verts.reshape(-1,3).detach().cpu().numpy(),
+                                                            verts_np,faces_np,hand_dict)
+                        hand_verts_canonicalize_save=hand_verts_canonicalize.detach().reshape(-1,3).cpu().numpy()
+                        hand_verts_shaped_save=hand_dict['v_shaped'].detach().reshape(-1,3).cpu().numpy()
+                        save_points(hand_verts_canonicalize_save,hand_verts_shaped_save,'hand_verts_canonicalize_vs_hand_verts_shaped.ply')
+
+                    if DEBUG:
+                        # 检查规范化后的点和规范化前的点是否对齐
+                        pts_save=pts.clone().detach().reshape(-1,3).cpu().numpy()
+                        pts_save=pts_save
+                        pts_save_before_canonical_normalize=pts_save.copy()
+                        hand_verts_save=hand_dict['v_shaped'].detach().reshape(-1,3).cpu().numpy()
+                        save_points(pts_save,hand_verts_save,'pts_after_canonical_vs_handverts_shaped.ply')
+                        
+                    pts=canonical_coor_normalizer(pts)
+
+                    if DEBUG:
+                        # 检查正则化后的点和规范化后的点是否对齐
+                        pts_save=pts.clone().detach().reshape(-1,3).cpu().numpy()
+                        pts_save=pts_save
+                        hand_verts_save=pts_save_before_canonical_normalize
+                        save_points(pts_save,hand_verts_save,'pts_normalized_vs_pts_after_canonical.ply')
+
+                    if DEBUG:
+                        # 检查正则化后的点和bbox是否对齐
+                        hand_verts_shaped_normalize=canonical_coor_normalizer(hand_dict['v_shaped'].detach().reshape(-1,3)).detach().reshape(-1,3).cpu().numpy()
+                        # bbox at eight points [-1,-1,-1],[1,-1,-1],[-1,1,-1],[1,1,-1],[-1,-1,1],[1,-1,1],[-1,1,1],[1,1,1]
+                        bbox=np.array([[-1,-1,-1],[1,-1,-1],[-1,1,-1],[1,1,-1],[-1,-1,1],[1,-1,1],[-1,1,1],[1,1,1]])
+                        save_points(hand_verts_shaped_normalize,bbox,'hand_verts_shaped_normalized_vs_bbox.ply')
+                    
+                    pts=pts.reshape(args.N_rand,-1,3)
+
+                    if TIME:
+                        t8=time.time()
+                        print(f't7-t8--warp pts:{t8-t7}')
+
+
+                    all_ret_0=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals,retraw=True, **render_kwargs_train)
+
+                    if TIME:
+                        t9=time.time()
+                        print(f't8-t9--first render rays:{t9-t8}')
+                    rgb_map_0, disp_map_0, acc_map_0,weights_0 = all_ret_0['rgb_map'], all_ret_0['disp_map'], all_ret_0['acc_map'], all_ret_0['weights']
+                    alpha_0=all_ret_0['alpha'] if 'alpha' in all_ret_0 else None
+
+                    z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
+                    z_samples = sample_pdf(
+                        z_vals_mid, weights_0[..., 1:-1], args.N_importance, det=(args.perturb == 0.))
+                    z_samples = z_samples.detach()
+
+                    z_vals, _ = torch.sort(torch.cat([z_vals, z_samples], -1), -1)
+                    pts = rays_o_reshape[..., None, :] + rays_d_reshape[..., None, :] * z_vals[..., :,
+                                                                            None]  # [N_rays, N_samples + N_importance, 3]
+
+                    pts=pts.reshape(1,-1,3)
+                    pts_np=pts.reshape(-1,3).detach().cpu().numpy()
+                    if TIME:
+                        t10=time.time()
+                        print(f't9-t10--sample pdf:{t10-t9}')
+
+                    # test_pts_w2canonical(hand_verts,faces,verts_np,faces_np,hand_dict)
+                    pts,ret_dict_warp=pts_w2canonical(pts,hand_verts,faces,pts_np,verts_np,faces_np,hand_dict,return_dict=True)
+                    signed_dist=ret_dict_warp['signed_dist']
+                    pts=canonical_coor_normalizer(pts)
+
+                    pts=pts.reshape(args.N_rand,-1,3)
+                    if TIME:
+                        t11=time.time()
+                        print(f't10-t11--warp pts:{t11-t10}')
+
+                    all_ret=render_rays_given_pts(pts, rays_o_reshape, rays_d_reshape, z_vals,retraw=True,fine_stage=True, **render_kwargs_train)
+
+                    if TIME:
+                        t12=time.time()
+                        print(f't11-t12--second render rays:{t12-t11}')
+                    y_gt_choose=y_true.squeeze(0)[hit_mask][hit_mask_near_far][rand_idx]
+
+                    rgb_map, disp_map, acc_map, weights = all_ret['rgb_map'], all_ret['disp_map'], all_ret['acc_map'], all_ret['weights']
+
+                    y_sil_true_choose=y_sil_true.squeeze(0)[hit_mask][hit_mask_near_far][rand_idx]
+
+            
+
+                    # # Shihouette
+                    # # Stop computing and updating silhouette when learning texture model
+                    # y_sil_pred = render_image(meshes, cam, cur_batch_size, silhouette_renderer, configs['img_size'], configs['focal_length'], silhouette=True)
+                    
+                    # # RGB UV
+                    # if configs["self_shadow"]:
+                    #     # Render with self-shadow
+                    #     light_R, light_T, cam_R, cam_T = renderer_helper.process_info_for_shadow(cam, light_positions, hand_verts.mean(1), 
+                    #                                         image_size=configs['img_size'], focal_length=configs['focal_length'])
+                    #     shadow_renderer = renderer_helper.get_shadow_renderers(image_size=img_size, 
+                    #         light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, 
+                    #         amb_ratio=nn.Sigmoid()(params['amb_ratio']), device=device)
+
+                    #     y_pred = render_image_with_RT(meshes, light_T, light_R, cam_T, cam_R,
+                    #                 cur_batch_size, shadow_renderer, configs['img_size'], configs['focal_length'], silhouette=False, 
+                    #                 materials_properties=materials_properties)
+                    # else:
+                    #     # Render without self-shadow
+                    #     y_pred = render_image(meshes, cam, cur_batch_size, phong_renderer, configs['img_size'], configs['focal_length'], 
+                    #                           silhouette=False, materials_properties=materials_properties)
+
+                    # if LOG_IMGAGE and epoch_id % 10 == 0 and mini_batch_count == 0:
+                    #     # Value range 0 (black) -> 1 (white)
+                    #     # Log silhouette
+                    #     show_img_pair(y_sil_pred.detach().cpu().numpy(), y_sil_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
+                    #             step=epoch_id, silhouette=True, prefix="")
+                    #     # Log RGB
+                    #     show_img_pair(y_pred.detach().cpu().numpy(), y_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
+                    #             step=epoch_id, silhouette=False, prefix="")
+                    #     # Loss visulization
+                    #     loss_image = torch.abs(y_true * y_sil_true_col.unsqueeze(-1) - y_pred * y_sil_true_col.unsqueeze(-1))
+                    #     show_img_pair(loss_image.detach().cpu().numpy(), y_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
+                    #             step=epoch_id, silhouette=False, prefix="loss_")
+                    
+
+                    
+
+                    # NOTE:New for hand_nerf: get rgb loss
+                    loss_rgb = ((rgb_map-y_gt_choose)**2).mean()
+                    loss_rgb_0 = ((rgb_map_0-y_gt_choose)**2).mean()
+                    loss['rgb_0'] = loss_rgb_0
+                    loss['rgb'] = loss_rgb
+
+                    if losses['acc']['weight'] > 0.:
+                        loss['acc']=((acc_map-y_sil_true_choose)**2).mean()
+                        loss['acc_0']=((acc_map_0-y_sil_true_choose)**2).mean()
+                    else:
+                        loss['acc']=torch.tensor(0.0, device=device)
+                        loss['acc_0']=torch.tensor(0.0, device=device)
+
+                    if losses['sparsity_reg']['weight'] > 0.:
+                        sparsity_reg = torch.mean(-torch.log(
+                            torch.exp(-torch.abs(acc_map.clamp(0.,1.))) + torch.exp(-torch.abs(1-acc_map.clamp(0.,1.)))
+                        + 1e-5) + HARD_SURFACE_OFFSET)
+
+                        sparsity_reg=sparsity_reg+torch.mean(-torch.log(
+                            torch.exp(-torch.abs(weights.clamp(0.,1.))) + torch.exp(-torch.abs(1-weights.clamp(0.,1.)))
+                        + 1e-5) + HARD_SURFACE_OFFSET)
+
+                        loss['sparsity_reg']=sparsity_reg
+
+                        sparsity_reg_0=torch.mean(-torch.log(
+                            torch.exp(-torch.abs(acc_map_0.clamp(0.,1.))) + torch.exp(-torch.abs(1-acc_map_0.clamp(0.,1.)))
+                        + 1e-5) + HARD_SURFACE_OFFSET)
+
+                        sparsity_reg_0=sparsity_reg_0+torch.mean(-torch.log(
+                            torch.exp(-torch.abs(weights_0.clamp(0.,1.))) + torch.exp(-torch.abs(1-weights_0.clamp(0.,1.)))
+                        + 1e-5) + HARD_SURFACE_OFFSET)
+
+                        loss['sparsity_reg_0']=sparsity_reg_0
+                    else:
+                        loss['sparsity_reg']=torch.tensor(0.0, device=device)
+                        loss['sparsity_reg_0']=torch.tensor(0.0, device=device)
+
+                    if losses['smpl_reg']['weight'] > 0.:
+
+                        inside_volume = signed_dist< 0
+                        raw_inside_volume = all_ret['raw'].reshape(-1, 4)[inside_volume]
+                        if inside_volume.sum() > 0:
+                            smpl_reg =  F.mse_loss(
+                                1 - torch.exp(-torch.relu(raw_inside_volume[:, 3])),
+                                torch.ones_like(raw_inside_volume[:, 3])
+                            ) 
+                        else:
+                            smpl_reg = torch.tensor(0.0, device=device)
+                        loss['smpl_reg'] = smpl_reg
+
+                        inside_volume_0 = signed_dist_0< 0
+                        raw_inside_volume_0 = all_ret_0['raw'].reshape(-1, 4)[inside_volume_0]
+                        if inside_volume_0.sum() > 0:
+                            smpl_reg_0 =  F.mse_loss(
+                                1 - torch.exp(-torch.relu(raw_inside_volume_0[:, 3])),
+                                torch.ones_like(raw_inside_volume_0[:, 3])
+                            ) 
+                        else:
+                            smpl_reg_0 = torch.tensor(0.0, device=device)
+                        loss['smpl_reg_0'] = smpl_reg_0
+                    else:
+                        loss['smpl_reg']=torch.tensor(0.0, device=device)
+                        loss['smpl_reg_0']=torch.tensor(0.0, device=device)
+
+                    if SMLP_REG_DUMMY and losses['smpl_reg_dummy']['weight'] > 0. and np.random.rand()<0.5:
+                        pts_dummy=torch.rand_like(pts)*2-1
+                        raw_smpl=render_kwargs_train['network_query_fn'](pts, None, render_kwargs_train['network_fn'])
+                        v_shaped_canonical_normalize=canonical_coor_normalizer(hand_dict['v_shaped'].detach().reshape(-1,3),clamp=False).detach().reshape(-1,3)
+                        mesh_v_shaped_canonical_normalize=Meshes(v_shaped_canonical_normalize.unsqueeze(0),params['mesh_faces'].unsqueeze(0).to(device))
+                        mesh_v_shaped_canonical_normalize=mesh_subdivider(mesh_v_shaped_canonical_normalize)
+                        # Meshes(v_shaped_canonical_normalize.unsqueeze(0),faces.unsqueeze(0))
+                        signed_dist_smpl_dummy,_,_=igl.signed_distance(pts_dummy.reshape(-1,3).detach().cpu().numpy(), 
+                                                                    mesh_v_shaped_canonical_normalize.verts_packed().squeeze(0).cpu().numpy(), 
+                                                                    mesh_v_shaped_canonical_normalize.faces_packed().squeeze(0).cpu().numpy())
+                        if DEBUG:
+                            mask=torch.from_numpy(signed_dist_smpl_dummy).to(device)
+                            mask=(mask<0.001)*(mask>-0.001)
+                            pts_dummy_save=(pts_dummy.clone().detach().reshape(-1,3)[mask]).cpu().numpy()
+                            hand_verts_save=mesh_v_shaped_canonical_normalize.verts_packed().squeeze(0).cpu().numpy()
+                            save_points(pts_dummy_save,hand_verts_save,'pts_dummy_vs_hand_verts.ply')
+
+
+                        inside_volume_smpl_dummy = signed_dist_smpl_dummy< 0
+                        raw_inside_volume_smpl_dummy = raw_smpl.reshape(-1, 4)[inside_volume_smpl_dummy]
+                        raw_outside_volume_smpl_dummy = raw_smpl.reshape(-1, 4)[~inside_volume_smpl_dummy]
+
+                        if DEBUG:
+                            mask=inside_volume_smpl_dummy
+                            pts_dummy_save=(pts_dummy.clone().detach().reshape(-1,3)[mask]).cpu().numpy()
+                            hand_verts_save=mesh_v_shaped_canonical_normalize.verts_packed().squeeze(0).cpu().numpy()
+                            save_points(pts_dummy_save,hand_verts_save,'pts_inside_vs_hand_verts.ply')
+
+
+                        if inside_volume_smpl_dummy.sum() > 0:
+                            smpl_reg_dummy =  F.mse_loss(
+                                1 - torch.exp(-torch.relu(raw_inside_volume_smpl_dummy[:, 3])),
+                                torch.ones_like(raw_inside_volume_smpl_dummy[:, 3])
+                            )
+                        else:
+                            smpl_reg_dummy = torch.tensor(0.0, device=device)
+                        if ~inside_volume_smpl_dummy.sum() > 0:
+                            smpl_reg_dummy = smpl_reg_dummy + F.mse_loss(
+                                torch.exp(-torch.relu(raw_outside_volume_smpl_dummy[:, 3])),
+                                torch.ones_like(raw_outside_volume_smpl_dummy[:, 3])
+                            )
+                        loss['smpl_reg_dummy'] = smpl_reg_dummy
+
+                        raw_smpl_0=render_kwargs_train['network_query_fn'](pts, None, render_kwargs_train['network_fine'])
+                        if inside_volume_smpl_dummy.sum() > 0:
+                            smpl_reg_dummy_0 =  F.mse_loss(
+                                1 - torch.exp(-torch.relu(raw_inside_volume_smpl_dummy[:, 3])),
+                                torch.ones_like(raw_inside_volume_smpl_dummy[:, 3])
+                            )
+                        else:
+                            smpl_reg_dummy_0 = torch.tensor(0.0, device=device)
+                        if ~inside_volume_smpl_dummy.sum() > 0:
+                            smpl_reg_dummy_0 = smpl_reg_dummy_0 + F.mse_loss(
+                                torch.exp(-torch.relu(raw_outside_volume_smpl_dummy[:, 3])),
+                                torch.ones_like(raw_outside_volume_smpl_dummy[:, 3])
+                            )
+                        loss['smpl_reg_dummy_0'] = smpl_reg_dummy_0
+                    else:
+                        loss['smpl_reg_dummy']=torch.tensor(0.0, device=device)
+                        loss['smpl_reg_dummy_0']=torch.tensor(0.0, device=device)
+                    
+                    if losses['lpips']['weight'] > 0. and PATCH:
+                        # reshape rgb_map and y_true to (1,PATCH_SIZE,PATCH_SIZE,3)
+                        rgb_map_lpips=rgb_map.reshape(1,PATCH_SIZE,PATCH_SIZE,3)
+                        y_gt_choose_lpips=y_gt_choose.reshape(1,PATCH_SIZE,PATCH_SIZE,3)
+                        rgb_map_lpips=rgb_map_lpips.permute(0,3,1,2)
+                        y_gt_choose_lpips=y_gt_choose_lpips.permute(0,3,1,2)
+                        loss['lpips']=lpips_fn(rgb_map_lpips,y_gt_choose_lpips,normalize=True).mean()
+
+                        rgb_map_0_lpips=rgb_map_0.reshape(1,PATCH_SIZE,PATCH_SIZE,3).permute(0,3,1,2)
+                        loss['lpips_0']=lpips_fn(rgb_map_0_lpips,y_gt_choose_lpips,normalize=True).mean()
+                    else:
+                        loss['lpips']=torch.tensor(0.0, device=device)
+                        loss['lpips_0']=torch.tensor(0.0, device=device)
+
+
+                    if ADVERSARIAL and PATCH and losses['adv_dis']['weight'] > 0.:
+                        y_input=torch.cat([rgb_map.reshape(1,PATCH_SIZE,PATCH_SIZE,3),rgb_map_0.reshape(1,PATCH_SIZE,PATCH_SIZE,3),
+                                            y_gt_choose.reshape(1,PATCH_SIZE,PATCH_SIZE,3)
+                                            ],dim=0)
+                        y_input=y_input.permute(0,3,1,2)
+                        judge=discriminator(y_input)
+                        judge_real=judge[-1]
+                        judge_fake=judge[:-1]
+                        # non-saturating loss for discriminator
+                        loss['adv_dis']=torch.log(1-judge_real+1e-7).mean()+torch.log(judge_fake+1e-7).mean()
+                        # non-saturating loss for generator
+                        loss['adv_gen']=torch.log(1-judge_fake+1e-7).mean()
+                    else:
+                        loss['adv_dis']=torch.tensor(0.0, device=device)
+                        loss['adv_gen']=torch.tensor(0.0, device=device)
+
+
                 
-                # Texture regularization
-                if not configs['model_type'] == 'nimble' and not configs['model_type'] == 'html':
-                    # Smooth local texture
-                    loss["albedo"] = albedo_reg(params['texture'], uv_mask=params["uv_mask"], std=1.0)
-                    loss["normal_reg"] = normal_reg(params['normal_map'], uv_mask=params["uv_mask"])
-            """
-            # Weighted sum of the losses
-            sum_loss = torch.tensor(0.0, device=device)
-            for k, l in loss.items():
-                sum_loss += l * losses[k]["weight"]
-                losses[k]["values"].append(float(l.detach().cpu()))
-                # tf_writer.add_scalar(k, l * losses[k]["weight"], n_iter)
-                if WANDB:
-                    wandb.log({k: l * losses[k]["weight"]})
-                    if (mini_batch_count %100<4) and PATCH:
-                        # save rgb_map,rgb_map_0 and y_gt_choose
-                        rgb_map_save=rgb_map.reshape(PATCH_SIZE,PATCH_SIZE,3).detach().cpu().numpy()
-                        rgb_map_0_save=rgb_map_0.reshape(PATCH_SIZE,PATCH_SIZE,3).detach().cpu().numpy()
-                        y_gt_choose_save=y_gt_choose.reshape(PATCH_SIZE,PATCH_SIZE,3).detach().cpu().numpy()
-                        wandb.log({"rgb_patch": wandb.Image(rgb_map_save, caption="rgb_patch")})
-                        wandb.log({"rgb_patch_0": wandb.Image(rgb_map_0_save, caption="rgb_patch_0")})
-                        wandb.log({"y_gt_choose_patch": wandb.Image(y_gt_choose_save, caption="y_gt_choose_patch")})
+
+                
+                # Weighted sum of the losses
+                sum_loss = torch.tensor(0.0, device=device)
+                for k, l in loss.items():
+                    sum_loss += l * losses[k]["weight"]
+                    losses[k]["values"].append(float(l.detach().cpu()))
+                    # tf_writer.add_scalar(k, l * losses[k]["weight"], n_iter)
+                    if WANDB :
+                        wandb.log({k: l * losses[k]["weight"]})
+                        if (mini_batch_count %100<4) and PATCH and APP_OPT:
+                            # save rgb_map,rgb_map_0 and y_gt_choose
+                            rgb_map_save=rgb_map.reshape(PATCH_SIZE,PATCH_SIZE,3).detach().cpu().numpy()
+                            rgb_map_0_save=rgb_map_0.reshape(PATCH_SIZE,PATCH_SIZE,3).detach().cpu().numpy()
+                            y_gt_choose_save=y_gt_choose.reshape(PATCH_SIZE,PATCH_SIZE,3).detach().cpu().numpy()
+                            wandb.log({"rgb_patch": wandb.Image(rgb_map_save, caption="rgb_patch")})
+                            wandb.log({"rgb_patch_0": wandb.Image(rgb_map_0_save, caption="rgb_patch_0")})
+                            wandb.log({"y_gt_choose_patch": wandb.Image(y_gt_choose_save, caption="y_gt_choose_patch")})
+                
+                    # print("%s: %.6f" % (k, l * losses[k]["weight"]))
+                
+                epoch_loss += sum_loss.detach().cpu()
+                # tf_writer.add_scalar('total_loss', sum_loss, n_iter)
+                if WANDB:wandb.log({"total_loss": sum_loss})
+                # report total_loss in bar
+                bar.set_description(("total_loss = %.6f" % sum_loss)+f' global_step:{global_step}' )
+                if TIME:
+                    t13=time.time()
+                    print(f't12-t13--compute loss:{t13-t12}')
+
+                opt_coarse.zero_grad()
+                opt_app.zero_grad()
+                optimizer.zero_grad()
+                if ADVERSARIAL:
+                    discriminator_optimizer.zero_grad()
+                if TIME:
+                    t14=time.time()
+                    print(f't13-t14--zero grad:{t14-t13}')
+                sum_loss.backward()
+                if TIME:
+                    t15=time.time()
+                    print(f't14-t15--backward:{t15-t14}')
+                if APP_OPT:
+                    optimizer.step()
+                    nerf_scheduler.step()
+                if ADVERSARIAL:
+                    discriminator_optimizer.step()
+                    discriminator_scheduler.step()
+                if TIME:
+                    t16=time.time()
+                    print(f't15-t16--step:{t16-t15}')
+
+                if COARSE_OPT:
+                    opt_coarse.step()
+                
+                frame_count += batch_size
+                n_iter += 1
+                # Delete the variables to free up memory
+                # del y_pred
+                del loss
+                # del rgb_map, disp_map, acc_map, weights, rgb_map_0, disp_map_0, acc_map_0, weights_0
+                # torch.cuda.empty_cache()
+
+                if LOG_IMGAGE and epoch_id % 1 == 0 and mini_batch_count == 0 and APP_OPT:
+                # if True:
+                    with torch.no_grad():
+                        if WANDB:
+                            rgb_all_0,rgb_all=render_whole_image(args,params,H,W,
+                                                                configs,hand_verts,faces,fid,
+                                                                render_kwargs_test,hand_dict,
+                                                                canonical_coor_normalizer,hand_joints,(y_sil_true_dil>0.).squeeze(0),device) # (H, W, 3) on cuda, range 0-1
+                            wandb.log({"rgb_all_0": wandb.Image(rgb_all_0.detach().cpu().numpy(), caption="rgb_all_0")})
+                            wandb.log({"rgb_all": wandb.Image(rgb_all.detach().cpu().numpy(), caption="rgb_all")})
+                            # y_true
+                            wandb.log({"y_true": wandb.Image(y_true.detach().cpu().numpy(), caption="y_true")})
+
+                            # compute psnr,lpips
+                            y_true_masked=y_true.squeeze(0)*y_sil_true.squeeze(0).unsqueeze(-1) # (H, W, 3) 
+                            psnr_0=(10*torch.log10(1./((rgb_all_0-y_true_masked)**2).mean())).item()
+                            psnr=(10*torch.log10(1./((rgb_all-y_true_masked)**2).mean())).item()
+                            lpips_0=lpips_fn(rgb_all_0.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
+                            lpips_=lpips_fn(rgb_all.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
+
+                            wandb.log({"psnr_0_train": psnr_0})
+                            wandb.log({"psnr_train": psnr})
+                            wandb.log({"lpips_0_train": lpips_0})
+                            wandb.log({"lpips_train": lpips_})
+
+                            if ADVERSARIAL:
+                                y_true_masked_white_bkg=y_true_masked.clone()
+                                y_true_masked_white_bkg[y_true_masked_white_bkg<1e-3]=1.-1e-5
+
+                                rgb_all_0_white_bkg=rgb_all_0
+                                rgb_all_white_bkg=rgb_all
+                                # randomly select 32 patches of (PATCH_SIZE,PATCH_SIZE) on y_true_masked_white_bkg, rgb_all_0_white_bkg, rgb_all_white_bkg
+                                small_indices=torch.randint(0,H-PATCH_SIZE,size=(32,2),device=device)
+                                y_true_patches=torch.stack([y_true_masked_white_bkg[small_indices[i,0]:small_indices[i,0]+PATCH_SIZE,small_indices[i,1]:small_indices[i,1]+PATCH_SIZE] for i in range(32)],dim=0)
+                                rgb_all_0_patches=torch.stack([rgb_all_0_white_bkg[small_indices[i,0]:small_indices[i,0]+PATCH_SIZE,small_indices[i,1]:small_indices[i,1]+PATCH_SIZE] for i in range(32)],dim=0)
+                                rgb_all_patches=torch.stack([rgb_all_white_bkg[small_indices[i,0]:small_indices[i,0]+PATCH_SIZE,small_indices[i,1]:small_indices[i,1]+PATCH_SIZE] for i in range(32)],dim=0) # (32, PATCH_SIZE, PATCH_SIZE, 3)
+
+                                all_patches=torch.cat([y_true_patches,rgb_all_0_patches,rgb_all_patches],dim=0) # (96, PATCH_SIZE, PATCH_SIZE, 3)
+                                all_patches=all_patches.permute(0,3,1,2) # (96, 3, PATCH_SIZE, PATCH_SIZE)
+                                judge=discriminator(all_patches)
+                                judge_fake, judge_real=judge[:32],judge[32:96]
+                                judge_fake_mean=judge_fake.mean().item()
+                                judge_real_mean=judge_real.mean().item()
+                                wandb.log({"judge_fake_mean": judge_fake_mean})
+                                wandb.log({"judge_real_mean": judge_real_mean})
+
+
+
+                global_step += 1
+                if global_step % args.i_weights == 0 and APP_OPT:
+                    path = os.path.join(args.basedir, args.expname, '{:06d}.tar'.format(global_step))
+                    to_save_dict={
+                        'global_step': global_step,
+                        'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict() if render_kwargs_train['network_fn'] is not None else None,
+                        'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict() if render_kwargs_train['network_fine'] is not None else None,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                    }
+                    if ADVERSARIAL:
+                        to_save_dict['discriminator_state_dict']=discriminator.state_dict()
+                        to_save_dict['discriminator_optimizer_state_dict']=discriminator_optimizer.state_dict()
+
+                    torch.save(to_save_dict, path)
+                    print('Saved checkpoints at', path)
+
+                if global_step % args.i_weights == 0 and COARSE_OPT:
+                    file_utils.save_result(params, base_output_dir, test=configs["known_appearance"])
+                
+                mini_batch_count += 1
+
             
-                # print("%s: %.6f" % (k, l * losses[k]["weight"]))
-            
-            epoch_loss += sum_loss.detach().cpu()
-            # tf_writer.add_scalar('total_loss', sum_loss, n_iter)
-            if WANDB:wandb.log({"total_loss": sum_loss})
-            # report total_loss in bar
-            bar.set_description(("total_loss = %.6f" % sum_loss)+f' global_step:{global_step}' )
-            if TIME:
-                t13=time.time()
-                print(f't12-t13--compute loss:{t13-t12}')
+        if COARSE_OPT:
+            sched_coarse.step(epoch_loss / mini_batch_count)
 
-            opt_coarse.zero_grad()
-            opt_app.zero_grad()
-            optimizer.zero_grad()
-            if TIME:
-                t14=time.time()
-                print(f't13-t14--zero grad:{t14-t13}')
-            sum_loss.backward()
-            if TIME:
-                t15=time.time()
-                print(f't14-t15--backward:{t15-t14}')
-            optimizer.step()
-            nerf_scheduler.step()
-            if TIME:
-                t16=time.time()
-                print(f't15-t16--step:{t16-t15}')
+        if epoch_id % 100 == 0 and epoch_id > 0:
+            file_utils.save_result(params, base_output_dir, test=configs["known_appearance"])
 
-            # if COARSE_OPT:
-            #     opt_coarse.step()
-            # if APP_OPT:
-            #     opt_app.step()
-            
-            frame_count += batch_size
-            n_iter += 1
-            # Delete the variables to free up memory
-            # del y_pred
-            del loss
-            del rgb_map, disp_map, acc_map, weights, rgb_map_0, disp_map_0, acc_map_0, weights_0
-            torch.cuda.empty_cache()
-
-            if LOG_IMGAGE and epoch_id % 1 == 0 and mini_batch_count == 0:
-            # if True:
-                with torch.no_grad():
-                    rgb_all_0,rgb_all=render_whole_image(args,params,H,W,
-                                                         configs,hand_verts,faces,fid,
-                                                         render_kwargs_test,hand_dict,
-                                                         canonical_coor_normalizer,hand_joints,(y_sil_true_dil>0.).squeeze(0),device) # (H, W, 3) on cuda, range 0-1
-                    # save to wandb, with gt
-                    if WANDB:
-                        wandb.log({"rgb_all_0": wandb.Image(rgb_all_0.detach().cpu().numpy(), caption="rgb_all_0")})
-                        wandb.log({"rgb_all": wandb.Image(rgb_all.detach().cpu().numpy(), caption="rgb_all")})
-                        # y_true
-                        wandb.log({"y_true": wandb.Image(y_true.detach().cpu().numpy(), caption="y_true")})
-
-                    # compute psnr,lpips
-                    y_true_masked=y_true.squeeze(0)*y_sil_true.squeeze(0).unsqueeze(-1) # (H, W, 3) 
-                    psnr_0=(10*torch.log10(1./((rgb_all_0-y_true_masked)**2).mean())).item()
-                    psnr=(10*torch.log10(1./((rgb_all-y_true_masked)**2).mean())).item()
-                    lpips_0=lpips_fn(rgb_all_0.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
-                    lpips_=lpips_fn(rgb_all.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
-                    # save to wandb
-                    if WANDB:
-                        wandb.log({"psnr_0_train": psnr_0})
-                        wandb.log({"psnr_train": psnr})
-                        wandb.log({"lpips_0_train": lpips_0})
-                        wandb.log({"lpips_train": lpips_})
-
-
-            global_step += 1
-            if global_step % args.i_weights == 0:
-                path = os.path.join(args.basedir, args.expname, '{:06d}.tar'.format(global_step))
-                torch.save({
-                    'global_step': global_step,
-                    'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict() if render_kwargs_train[
-                        'network_fn'] is not None else None,
-                    'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict() if render_kwargs_train[
-                        'network_fine'] is not None else None,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }, path)
-                print('Saved checkpoints at', path)
-            
-            mini_batch_count += 1
-            
-        print(" Epoch loss = %.6f" % (epoch_loss / mini_batch_count))
-        # tf_writer.add_scalar('total_loss_epoch', (epoch_loss / mini_batch_count), epoch_id)
-        wandb.log({"total_loss_epoch": (epoch_loss / mini_batch_count)})
-
-        if epoch_id % 25==0 and epoch_id>0:
+        if ((epoch_id % 50==0 and epoch_id>0 and TEST_VAL) or ONLY_TEST) and APP_OPT:
             # traverse val dataloader
             with torch.no_grad():
                 average_psnr_0=0
@@ -1535,41 +1732,72 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                 average_lpips_0=0
                 average_lpips=0
                 idx_val=0
-                for (fid, y_true, y_sil_true, 
-                     y_sil_true_ero, y_sil_true_dil) in (tqdm(val_images_dataloader,desc='Running validation')):
-                    y_sil_true = y_sil_true.squeeze(-1).squeeze(0).to(device)
-                    y_true=y_true.squeeze(0).to(device)
-                    y_sil_true_ero=y_sil_true_ero.squeeze(-1).squeeze(0).to(device)
-                    y_sil_true_dil=y_sil_true_dil.squeeze(-1).squeeze(0).to(device)
-                    rgb_all_0,rgb_all=render_whole_image(args,params,H,W,
-                                                         configs,hand_verts,faces,fid,
-                                                         render_kwargs_test,hand_dict,
-                                                         canonical_coor_normalizer,hand_joints,(y_sil_true_dil>0.).squeeze(0),device)
-                    # save to wandb, with gt
-                    if WANDB and idx_val%20==0:
-                        wandb.log({"rgb_all_0_val": wandb.Image(rgb_all_0.detach().cpu().numpy(), caption="rgb_all_0_val")})
-                        wandb.log({"rgb_all_val": wandb.Image(rgb_all.detach().cpu().numpy(), caption="rgb_all_val")})
-                        # y_true
-                        wandb.log({"y_true_val": wandb.Image(y_true.detach().cpu().numpy(), caption="y_true_val")})
-                    
-                    # compute psnr,lpips
-                    y_true_masked=y_true.squeeze(0)*y_sil_true.squeeze(0).unsqueeze(-1) # (H, W, 3)
-                    psnr_0=(10*torch.log10(1./((rgb_all_0-y_true_masked)**2).mean())).item()
-                    psnr=(10*torch.log10(1./((rgb_all-y_true_masked)**2).mean())).item()
-                    lpips_0=lpips_fn(rgb_all_0.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
-                    lpips_=lpips_fn(rgb_all.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
-                    
-                    # add to average
-                    average_psnr_0+=psnr_0
-                    average_psnr+=psnr
-                    average_lpips_0+=lpips_0
-                    average_lpips+=lpips_
-                    idx_val+=1
+                ratio=1
+                val_output_basedir=os.path.join(args.basedir, args.expname, 'val_output')
+                os.makedirs(val_output_basedir,exist_ok=True)
+                try:
+                    for (fid, y_true, y_sil_true, 
+                        y_sil_true_ero, y_sil_true_dil) in (tqdm(val_images_dataloader,desc='Running validation')):
+                        if idx_val%ratio!=0:
+                            idx_val+=1
+                            continue
+                        y_sil_true = y_sil_true.squeeze(-1).squeeze(0).to(device)
+                        y_true=y_true.squeeze(0).to(device)
+                        y_sil_true_ero=y_sil_true_ero.squeeze(-1).squeeze(0).to(device)
+                        y_sil_true_dil=y_sil_true_dil.squeeze(-1).squeeze(0).to(device)
+                        hand_joints, hand_verts, faces, textures, hand_dict = prepare_mesh_NeRF(val_params, fid, 
+                                                                                hand_layer, use_verts_textures, mesh_subdivider,
+                                                                                global_pose=GLOBAL_POSE, configs=configs, 
+                                                                                shared_texture=SHARED_TEXTURE, device=device, 
+                                                                                use_arm=configs['use_arm'])
+                        rgb_all_0,rgb_all=render_whole_image(args,val_params,H,W,
+                                                            configs,hand_verts,faces,fid,
+                                                            render_kwargs_test,hand_dict,
+                                                            canonical_coor_normalizer,hand_joints,(y_sil_true_dil>0.).squeeze(0),device)
+                        # save to wandb, with gt
+                        if WANDB and idx_val%1==0:
+                            wandb.log({"rgb_all_0_val": wandb.Image(rgb_all_0.detach().cpu().numpy(), caption="rgb_all_0_val")})
+                            wandb.log({"rgb_all_val": wandb.Image(rgb_all.detach().cpu().numpy(), caption="rgb_all_val")})
+                            # y_true
+                            wandb.log({"y_true_val": wandb.Image(y_true.detach().cpu().numpy(), caption="y_true_val")})
 
-                average_psnr_0=average_psnr_0/len(val_images_dataloader)
-                average_psnr=average_psnr/len(val_images_dataloader)
-                average_lpips_0=average_lpips_0/len(val_images_dataloader)
-                average_lpips=average_lpips/len(val_images_dataloader)
+                        fid=fid.item()
+                        # save to val_output_basedir, using PIL Image
+                        rgb_all_0_save=rgb_all_0.detach().cpu().numpy()
+                        rgb_all_0_save[rgb_all_0_save<1e-3]=1.-1e-5
+                        rgb_all_save=rgb_all.detach().cpu().numpy()
+                        rgb_all_save[rgb_all_save<1e-3]=1.-1e-5
+                        y_true_save=y_true.detach().cpu().numpy()
+                        y_true_save[y_true_save<1e-3]=1.-1e-5
+                        rgb_all_0_save=Image.fromarray(np.uint8(rgb_all_0_save*255))
+                        rgb_all_save=Image.fromarray(np.uint8(rgb_all_save*255))
+                        y_true_save=Image.fromarray(np.uint8(y_true_save*255))
+                        rgb_all_0_save.save(os.path.join(val_output_basedir,f'{fid}_rgb_all_0_val.png'))
+                        rgb_all_save.save(os.path.join(val_output_basedir,f'{fid}_rgb_all_val.png'))
+                        y_true_save.save(os.path.join(val_output_basedir,f'{fid}_y_true_val.png'))
+
+                        # compute psnr,lpips
+                        y_true_masked=y_true.squeeze(0)*y_sil_true_dil.squeeze(0).unsqueeze(-1) # (H, W, 3)
+                        rgb_all_masked=rgb_all*y_sil_true_dil.squeeze(0).unsqueeze(-1)
+                        rgb_all_0_masked=rgb_all_0*y_sil_true_dil.squeeze(0).unsqueeze(-1)
+                        psnr_0=(10*torch.log10(1./((rgb_all_0_masked-y_true_masked)**2).mean())).item()
+                        psnr=(10*torch.log10(1./((rgb_all_masked-y_true_masked)**2).mean())).item()
+                        lpips_0=lpips_fn(rgb_all_0_masked.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
+                        lpips_=lpips_fn(rgb_all_masked.unsqueeze(0).permute(0,3,1,2),y_true_masked.unsqueeze(0).permute(0,3,1,2),normalize=True).mean().item()
+                        
+                        print(f'frame:{idx_val} psnr_0:{psnr_0} psnr:{psnr} lpips_0:{lpips_0} lpips:{lpips_}')
+                        # add to average
+                        average_psnr_0+=psnr_0
+                        average_psnr+=psnr
+                        average_lpips_0+=lpips_0
+                        average_lpips+=lpips_
+                        idx_val+=1
+                except:
+                    print('error in val')
+                average_psnr_0=average_psnr_0/len(val_images_dataloader)*ratio
+                average_psnr=average_psnr/len(val_images_dataloader)*ratio
+                average_lpips_0=average_lpips_0/len(val_images_dataloader)*ratio
+                average_lpips=average_lpips/len(val_images_dataloader)*ratio
                 # save to wandb
                 if WANDB:
                     wandb.log({"psnr_0_val": average_psnr_0})
@@ -1577,236 +1805,33 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                     wandb.log({"lpips_0_val": average_lpips_0})
                     wandb.log({"lpips_val": average_lpips})
 
-        # if epoch_id % 20 == 0:
-        #     visualize_val(val_images_dataloader, epoch_id, device, params, val_params, configs, hand_layer,
-        #                   mesh_subdivider, opt_app, use_verts_textures, GLOBAL_POSE, SHARED_TEXTURE)
+                # save to val_output_basedir
+                with open(os.path.join(val_output_basedir,'val_result.txt'),'w') as f:
+                    f.write(f'average_psnr_0:{average_psnr_0} average_psnr:{average_psnr} average_lpips_0:{average_lpips_0} average_lpips:{average_lpips}')
 
-        # if epoch_id % 200 == 0 and epoch_id > 0:
-        #     file_utils.save_result(params, base_output_dir, test=configs["known_appearance"])
-    #### Done Optimization ####
+                if False:
+                    # combine {fid}_rgb_all_0_val.png ... into a gif, 25 fps
+                    # save to val_output_basedir
+                    filename=os.path.join(val_output_basedir,'val_result_rgb_0.gif')
+                    filenames=[os.path.join(val_output_basedir,f'{fid}_rgb_all_0_val.png') for fid in range(len(val_images_dataloader)) if os.path.exists(os.path.join(val_output_basedir,f'{fid}_rgb_all_0_val.png'))]
+                    filenames=sorted(filenames)
+                    images=[]
+                    for filename in filenames:
+                        images.append(imageio.imread(filename))
+                    imageio.mimsave(filename,images,fps=25)
 
-    # Save results
-    file_utils.save_result(params, base_output_dir, test=configs["known_appearance"])
+                    filename=os.path.join(val_output_basedir,'val_result_rgb.gif')
+                    filenames=[os.path.join(val_output_basedir,f'{fid}_rgb_all_val.png') for fid in range(len(val_images_dataloader)) if os.path.exists(os.path.join(val_output_basedir,f'{fid}_rgb_all_val.png'))]
+                    filenames=sorted(filenames)
+                    images=[]
+                    for filename in filenames:
+                        images.append(imageio.imread(filename))
+                    imageio.mimsave(filename,images,fps=25)
 
-    # Output render images after optimization
-    images_dataloader = DataLoader(images_dataset, batch_size=1, shuffle=False, num_workers=20)
+                if ONLY_TEST:return
 
-    # val_params['shape'] = params['shape']
-    # val_params['pose'] = params['pose']
-    # val_params['mesh_faces'] = params['mesh_faces']
-    # val_params['verts_rgb'] = params['verts_rgb']
 
-    # Copy appearance parameters
-    if not use_verts_textures:
-        val_params['verts_uvs'] = params['verts_uvs']
-        val_params['faces_uvs'] = params['faces_uvs']
-        val_params['texture'] = params['texture']
-    if VERT_DISPS:
-        val_params['verts_disps'] = params['verts_disps']
 
-    # Result dict
-    images_for_eval = {
-        "ref_image": [],
-        "ref_mask": [],
-        "pred_image": [],
-        "pred_mask": []
-    }
-    image_stat_list = {
-        "Silhouette IoU": [],
-        "L1": [],
-        "LPIPS": [],
-        "MS_SSIM": []
-    }
-    SAVE_TEXTURE = True
-    if SAVE_TEXTURE:
-        uv_out_dir = os.path.join(base_output_dir, "uv_out")
-        os.makedirs(uv_out_dir, exist_ok=True)
-        uv_mask = params["uv_mask"]
-        if isinstance(uv_mask, torch.Tensor):
-            uv_mask = uv_mask.cpu().numpy()
-
-        pred_texture_out = params["texture"]
-        if isinstance(pred_texture_out, torch.Tensor):
-            pred_texture_out = pred_texture_out.detach().cpu().numpy()[0]
-        if uv_mask is None:
-            uv_mask = np.ones(pred_texture_out.shape[:2])
-
-        texture_out_path = os.path.join(uv_out_dir, "texture.png")
-        texture_out = pred_texture_out.clip(0,1) * np.expand_dims(uv_mask, 2)
-        texture_out_pil = Image.fromarray(np.uint8(texture_out*255))
-        texture_out_pil.save(texture_out_path)
-
-        if 'normal_map' in params:
-            opt_normal_out = torch.nn.functional.normalize(params["normal_map"], dim=-1)
-            opt_normal_out = opt_normal_out.detach().cpu().numpy()
-            if not uv_mask is None:
-                opt_normal_out = (opt_normal_out / 2.0 + 0.5) * np.expand_dims(uv_mask, 2)
-            else:
-                opt_normal_out = (opt_normal_out / 2.0 + 0.5)
-            normal_out_pil = Image.fromarray(np.uint8(opt_normal_out[0].clip(0,1) * 255))
-            normal_out_pil.save(os.path.join(uv_out_dir, "normal_map.png"))
-
-    joint_err_list = []
-    vert_err_list = []
-    batch_size = 1
-    test_name = "_test" if configs["known_appearance"] else ""
-    os.makedirs(base_output_dir + "rendered_after_opt" + test_name, exist_ok=True)
-    # Eval
-    def clear_and_create_new_eval_dict(images_for_eval):
-        del images_for_eval
-        images_for_eval = {
-            "ref_image": [],
-            "ref_mask": [],
-            "pred_image": [],
-            "pred_mask": []
-        }
-        return images_for_eval
-
-    with torch.no_grad():
-        # Loop through the dataset
-        for (fid, y_true, y_sil_true, _) in tqdm(images_dataloader):
-            y_sil_true = y_sil_true.squeeze(-1).to(device)
-            cur_batch_size = fid.shape[0]
-            if configs["share_light_position"]:
-                light_positions = params['light_positions'][0].repeat(cur_batch_size, 1)
-            else:
-                light_positions = params['light_positions'][fid]
-            phong_renderer, silhouette_renderer, normal_renderer = renderer_helper.get_renderers(image_size=img_size, 
-                light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, device=device)
-
-            # Meshes
-            hand_joints, hand_verts, faces, textures = prepare_mesh_NeRF(params, fid, hand_layer, use_verts_textures, mesh_subdivider,
-                global_pose=GLOBAL_POSE, configs=configs, shared_texture=SHARED_TEXTURE, use_arm=configs['use_arm'], device=device)
-            # Material properties
-            materials_properties = prepare_materials(params, fid.shape[0])
-
-            meshes = Meshes(hand_verts, faces, textures)
-
-            cam = params['cam'][fid]
-            cur_batch_size = fid.shape[0]
-            # Render Shihouette
-            y_sil_pred = render_image(meshes, cam, cur_batch_size, silhouette_renderer, configs['img_size'], configs['focal_length'], silhouette=True)
-            # Render RGB UV
-            if configs["self_shadow"]:
-                light_R, light_T, cam_R, cam_T = renderer_helper.process_info_for_shadow(cam, light_positions, hand_verts.mean(1), 
-                                                    image_size=configs['img_size'], focal_length=configs['focal_length'])
-                shadow_renderer = renderer_helper.get_shadow_renderers(image_size=img_size, 
-                    light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50,
-                    amb_ratio=nn.Sigmoid()(params['amb_ratio']), device=device)
-                y_pred = render_image_with_RT(meshes, light_T, light_R, cam_T, cam_R,
-                            cur_batch_size, shadow_renderer, configs['img_size'], configs['focal_length'], silhouette=False,
-                            materials_properties=materials_properties)
-            else:
-                y_pred = render_image(meshes, cam, cur_batch_size, phong_renderer, configs['img_size'], configs['focal_length'], silhouette=False, 
-                                      materials_properties=materials_properties)
-            # Render Normal
-            hand_joints, hand_verts, faces, textures_normal = prepare_mesh(params, fid, hand_layer, use_verts_textures, 
-                  mesh_subdivider, global_pose=GLOBAL_POSE, configs=configs, device=device, vis_normal=True, use_arm=configs['use_arm'])
-            meshes_normal = Meshes(hand_verts, faces, textures_normal)
-            y_pred_normal = render_image(meshes_normal, cam, cur_batch_size, normal_renderer, configs['img_size'], 
-                                        configs['focal_length'], silhouette=False, materials_properties=materials_properties)
-
-            # Select one frame to render 360 degree
-            if fid[0] == 0: # 0:
-                with torch.no_grad():
-                    render_360(params, fid, phong_renderer, configs['img_size'], configs['focal_length'], hand_layer, configs=configs, use_arm=configs['use_arm'],
-                        verts_textures=use_verts_textures, mesh_subdivider=mesh_subdivider, global_pose=GLOBAL_POSE, save_img_dir=base_output_dir)
-                    
-                    render_360(params, fid, normal_renderer, configs['img_size'], configs['focal_length'], hand_layer, configs=configs, render_normal=True, use_arm=configs['use_arm'],
-                        verts_textures=use_verts_textures, mesh_subdivider=mesh_subdivider, global_pose=GLOBAL_POSE, save_img_dir=base_output_dir)
-                    
-                    concat_image_in_dir(base_output_dir + "render_360", base_output_dir + "render_360_normal", base_output_dir + "render_360_combine")
-
-                    render_360_light(params, fid, hand_verts, faces, textures, configs['img_size'], configs['focal_length'], save_img_dir=base_output_dir)
-
-            if IMAGE_EVAL:
-                # Eval in batch
-                images_for_eval["ref_image"].append(y_true.detach().cpu())
-                images_for_eval["ref_mask"].append(y_sil_true.detach().cpu())
-                images_for_eval["pred_image"].append(y_pred.detach().cpu())
-                images_for_eval["pred_mask"].append(y_sil_pred.detach().cpu())
-                eval_batch_size = 64
-                if len(images_for_eval["ref_image"]) >= eval_batch_size:
-                    image_stats = image_eval(images_for_eval)
-                    images_for_eval = clear_and_create_new_eval_dict(images_for_eval)
-                    for k,v in image_stats.items():
-                        image_stat_list[k].append(v)
-
-            # Save image comparison
-            fig_out_dir = base_output_dir + "rendered_after_opt" + test_name + "/" + "%04d.jpg" % (fid)
-            img_true = y_true.detach().cpu().numpy()[0].clip(0,1) * 255
-            img_array = y_pred.detach().cpu().numpy()[0].clip(0,1) * 255 # .transpose(2, 0, 1)
-            img_array_normal = y_pred_normal.detach().cpu().numpy()[0].clip(0,1) * 255 # .transpose(2, 0, 1)
-            
-            ypred_np, ytrue_np = y_sil_pred.detach().cpu().numpy(), y_sil_true.detach().cpu().numpy()
-            overlay = np.zeros([*ytrue_np[0].shape[:2], 3])
-            overlay[:, :, 0] = ytrue_np[0]
-            overlay[:, :, 2] = ypred_np[0]
-            overlay = overlay * 225
-
-            img_array = np.concatenate([img_true, img_array, img_array_normal, overlay], axis=1)
-            img_array = img_array.astype(np.uint8)
-            out_img = Image.fromarray(img_array)
-            out_img.save(fig_out_dir)
-
-            # Eval mesh vertices - for data where we have GT
-            if configs["eval_mesh"]:
-                gt_mano_verts = load_gt_vert(fid, configs["gt_mesh_dir"], dataset="synthetic", start_from_one=True, idx_offset=500)
-                hand_joints, hand_verts, faces, textures = prepare_mesh(params, fid, hand_layer, use_verts_textures, mesh_subdivider, 
-                    global_pose=GLOBAL_POSE, configs=configs, shared_texture=SHARED_TEXTURE, use_arm=configs['use_arm'], device=device)
-                if configs["use_arm"]:
-                    pred_mano_verts = hand_verts[0, hand_layer.right_mano_idx].detach().cpu().numpy()
-                else:
-                    pred_mano_verts = hand_verts[0, :778].detach().cpu().numpy()
-
-                xyz_pred_aligned = align_w_scale(gt_mano_verts, pred_mano_verts)
-                err = gt_mano_verts - xyz_pred_aligned
-
-                mean_verts_err = np.linalg.norm(err, axis=1).mean()
-                # print("mean joint err: %.3f mm" % (mean_verts_err * 1000.0))
-                vert_err_list.append(mean_verts_err * 1000.0)
-
-            # export mesh
-            EXPORT_MESH = False
-            if EXPORT_MESH:
-                with torch.no_grad():
-                    meshes_2 = taubin_smoothing(meshes)
-                from pytorch3d.io import save_obj
-                mesh_test_path =  os.path.join(base_output_dir, 'mesh', "%04d.obj" % (fid[0]))
-                os.makedirs(os.path.join(base_output_dir, 'mesh'), exist_ok=True)
-                # hand_joints
-                save_obj(mesh_test_path,
-                        verts=meshes_2.verts_padded()[0].detach().cpu(),
-                        faces=meshes.faces_padded()[0].detach().cpu(),
-                        verts_uvs=meshes.textures.verts_uvs_padded()[0].detach().cpu(),
-                        faces_uvs=meshes.textures.faces_uvs_padded()[0].detach().cpu(),
-                        texture_map=meshes.textures.maps_padded()[0].detach().cpu().clamp(0,1)
-                        )
-
-    if IMAGE_EVAL:
-        if len(images_for_eval["ref_image"]) > 0:
-            image_stats = image_eval(images_for_eval)
-            for k,v in image_stats.items():
-                image_stat_list[k].append(v)
-        
-        final_stats = {}
-        for k, v in image_stat_list.items():
-            final_stats[k] = np.mean(v)
-        
-        if len(vert_err_list) > 0:
-            final_stats["Procrustes-aligned vertex error (mm)"] = np.mean(vert_err_list)
-            np.savetxt(os.path.join(base_output_dir, "eval_vert_mm" + test_name + ".txt"), vert_err_list)
-        # vert_err_list.append(mean_verts_err * 1000.0)
-
-        print("  -- Evaluation --")
-        # Update eval stat dict
-        for (k, v) in final_stats.items():
-            print(" %s: %.5f" % (k, v))
-
-        out_result_file = os.path.join(base_output_dir, "eval_results" + test_name + ".txt")
-        with open(out_result_file, "w") as f_out:
-            for (k, v) in final_stats.items():
-                f_out.write(" %s: %.5f\n" % (k, v))
 
 
 def main():

@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 
 
-def load_img(img_path, torch_tensor=False, downsample_factor=1, load_mask=False, erode=False, dilate=False):
+def load_img(img_path, torch_tensor=False, downsample_factor=1, load_mask=False, erode=False, dilate=False, val=False):
 
     assert not (erode and dilate), "Cannot erode and dilate at the same time"
     
@@ -22,8 +22,12 @@ def load_img(img_path, torch_tensor=False, downsample_factor=1, load_mask=False,
             img = cv2.dilate(img, kernel, iterations=3)
         
         if dilate:
-            kernel = np.ones((3,3), np.uint8)
-            img = cv2.dilate(img, kernel, iterations=2)
+            if not val:
+                kernel = np.ones((3,3), np.uint8)
+                img = cv2.dilate(img, kernel, iterations=2)
+            else:
+                kernel = np.ones((5,5), np.uint8)
+                img = cv2.dilate(img, kernel, iterations=3)                
 
 
     else:

@@ -408,7 +408,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
     depth_map = torch.sum(weights * z_vals, -1)
     disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
     acc_map = torch.sum(weights, -1)
-    rgb_map=rgb_map.clamp(1e-6,1-1e-6)
+    rgb_map=rgb_map.clamp(1e-5,1-1e-5)
 
     if white_bkgd:
         rgb_map = rgb_map + (1. - acc_map[..., None])
