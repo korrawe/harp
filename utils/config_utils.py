@@ -19,18 +19,19 @@ def get_config(yaml_file=None):
         "share_light_position": True,
         "eval_mesh": False,
         "use_vert_disp": True,
-        "total_epoch": 401,
+        "total_epoch": 301,
         # [shape, shape and appearance, appearance only]
-        "training_stage": [100, 0, 300],
+        "training_stage": [0, 0, 300],
         "metro_output_dir": "./data/sample_data/1/",
         "image_dir": "./data/sample_data/1/",
         "train_list": ["1", "2"],
         "val_list": ["1", "2"],
         "gt_mesh_dir": "",
         # Output directory
-        "base_output_dir": "exp/out_test/",
-        # "start_from": "exp/out_test/"
-        "start_from": "",
+        "base_output_dir": "exp/out_test0/",
+        # "start_from": "exp/out_test0/"
+        # "start_from": "exp/out_test2/", #是优化几何的
+        "start_from": ""
     }
     if config_dict["use_arm"]:
         # Arm Template

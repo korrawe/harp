@@ -88,16 +88,28 @@ class NeRF_TCNN(nn.Module):
         )
 
     def forward(self, input):
+        if input.isnan().any():
+            raise RuntimeError('nan in input')
+        elif input.isinf().any():
+            raise RuntimeError('inf in input')
         x = input[:, :3]
         # x: [N, 3], in [-1, 1]
-        # x=(x+self.bound)/(2*self.bound) # to [0,1]
+        x=(x+self.bound)/(2*self.bound) # to [0,1]
         x = self.encoder(x)
+        if x.isnan().any():
+            raise RuntimeError('nan in encode output')
+        elif x.isinf().any():
+            raise RuntimeError('inf in encode output')
         h = self.sigma_net(x)
 
         sigma = h[..., 0]
         geo_feat = h[..., 1:]
 
         h = geo_feat
+        if h.isnan().any():
+            raise RuntimeError('nan in geo_feat')
+        elif h.isinf().any():
+            raise RuntimeError('inf in geo_feat')
         h = self.color_net(h)
 
         # sigmoid activation for rgb

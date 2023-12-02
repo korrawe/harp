@@ -465,12 +465,10 @@ def debug_ray_point_and_mesh(params,hand_layer,configs,mesh_subdivider):
 
 def warp_samples_to_canonical_diff(pts_np,verts_np,faces_np, T):
     # f_id, unsigned_squared_dist=point_mesh_distance_modified.point_mesh_face_distance(pcl, meshes)
-    signed_dist, f_id, closest = igl.signed_distance(pts_np, verts_np, faces_np[:, :3])
+    signed_dist, f_id, closest = igl.signed_distance(pts_np, verts_np, faces_np[:, :3]) # bottleneck
     # differentiable barycentric interpolation
-
     closest_face_np = faces_np[:, :3][f_id]
     closest_face_device_T=torch.from_numpy(closest_face_np).to(T.device) # (N, 3)
-
     closest_tri = verts_np[closest_face_np]
     closest_tri=torch.from_numpy(closest_tri).float().to(T.device)
     closest = torch.from_numpy(closest).float().to(T.device)
@@ -503,7 +501,7 @@ def pts_w2canonical(pts,verts,faces,pts_np,verts_np,faces_np,hand_dict,return_di
     assert len(pts.shape)==3, "pts should be (batch_size, N, 3),got {}".format(pts.shape)
 
     # warp_samples_to_canonical_diff
-    T_interp_inv, f_id, signed_dist=warp_samples_to_canonical_diff(pts_np,verts_np,faces_np, hand_dict['T'].squeeze(0))
+    T_interp_inv, f_id, signed_dist=warp_samples_to_canonical_diff(pts_np,verts_np,faces_np, hand_dict['T'].squeeze(0)) #bottleneck
 
     T_interp_inv=T_interp_inv.to(pts.device) # (N, 4, 4)
     f_id=f_id.to(pts.device) # (N,)
@@ -858,8 +856,8 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
     PATCH=True
     PATCH_SIZE=64
     TEST_VAL=True
-    ONLY_TEST=False
-    if ONLY_TEST:TEST_VAL=True
+    ONLY_TEST=True
+    # if ONLY_TEST:TEST_VAL=True
     if DEBUG:WANDB=False
     TIME=False
     HARD_SURFACE_OFFSET=0.31326165795326233
@@ -880,7 +878,6 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
     use_verts_textures = False
     SHARED_TEXTURE = True
     # anobaly detection
-    torch.autograd.set_detect_anomaly(True)
     LOG_IMGAGE = True
     # Get mesh faces
     # if configs["model_type"] == "html":
@@ -955,6 +952,8 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                         VERTS_UVS, FACES_UVS, model_type=configs["model_type"], use_arm=configs["use_arm"], configs=configs, device=device)
         # val_params=params
         val_params=params_cam2transform(val_params,configs,device=device)
+    else:
+        val_params=params
 
     #### End initialization ####
 
@@ -990,8 +989,8 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
             'rgb':         {"weight": 1.0, "values": []}, # 1.0 ## 1.0
             'acc_0':         {"weight": 0.001, "values": []}, 
             'acc':         {"weight": 0.001, "values": []},
-            'sparsity_reg':  {"weight": 0.1, "values": []},
-            'sparsity_reg_0':  {"weight": 0.1, "values": []},
+            'sparsity_reg':  {"weight": 0.01, "values": []},
+            'sparsity_reg_0':  {"weight": 0.01, "values": []},
             'smpl_reg':      {"weight": 0.1, "values": []},
             'smpl_reg_0':      {"weight": 0.1, "values": []},
             'smpl_reg_dummy':      {"weight": 0.1, "values": []},
@@ -1019,7 +1018,6 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
             # 'adv_dis_0':         {"weight": 0., "values": []},
             
          }
-    # torch.autograd.set_detect_anomaly(True)
 
     lpips_fn=lpips.LPIPS(net='alex').to(device)
     for param in lpips_fn.parameters():
@@ -1029,12 +1027,12 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf_tcnn(
             args)   
     
-    # # set lr of optimizer to be 0.005
-    # for param_group in optimizer.param_groups:
-    #     param_group['lr'] = 0.005
+    # set lr of optimizer to be 0.005
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = 0.008
 
 
-    nerf_scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.9, last_epoch=-1)
+    
 
     if ADVERSARIAL:
         assert PATCH, 'ADVERSARIAL must be used with PATCH'
@@ -1095,6 +1093,8 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
     n_iter = 0
     global_step=start
     epoch_start=start//(len(images_dataloader))
+
+    # nerf_scheduler=torch.optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.9, last_epoch=-1)
 
     PATCH_ORIGINAL=PATCH
     N_rand_original=args.N_rand
@@ -1388,44 +1388,32 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
 
                     y_sil_true_choose=y_sil_true.squeeze(0)[hit_mask][hit_mask_near_far][rand_idx]
 
-            
-
-                    # # Shihouette
-                    # # Stop computing and updating silhouette when learning texture model
-                    # y_sil_pred = render_image(meshes, cam, cur_batch_size, silhouette_renderer, configs['img_size'], configs['focal_length'], silhouette=True)
-                    
-                    # # RGB UV
-                    # if configs["self_shadow"]:
-                    #     # Render with self-shadow
-                    #     light_R, light_T, cam_R, cam_T = renderer_helper.process_info_for_shadow(cam, light_positions, hand_verts.mean(1), 
-                    #                                         image_size=configs['img_size'], focal_length=configs['focal_length'])
-                    #     shadow_renderer = renderer_helper.get_shadow_renderers(image_size=img_size, 
-                    #         light_posi=light_positions, silh_sigma=1e-7, silh_gamma=1e-1, silh_faces_per_pixel=50, 
-                    #         amb_ratio=nn.Sigmoid()(params['amb_ratio']), device=device)
-
-                    #     y_pred = render_image_with_RT(meshes, light_T, light_R, cam_T, cam_R,
-                    #                 cur_batch_size, shadow_renderer, configs['img_size'], configs['focal_length'], silhouette=False, 
-                    #                 materials_properties=materials_properties)
-                    # else:
-                    #     # Render without self-shadow
-                    #     y_pred = render_image(meshes, cam, cur_batch_size, phong_renderer, configs['img_size'], configs['focal_length'], 
-                    #                           silhouette=False, materials_properties=materials_properties)
-
-                    # if LOG_IMGAGE and epoch_id % 10 == 0 and mini_batch_count == 0:
-                    #     # Value range 0 (black) -> 1 (white)
-                    #     # Log silhouette
-                    #     show_img_pair(y_sil_pred.detach().cpu().numpy(), y_sil_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
-                    #             step=epoch_id, silhouette=True, prefix="")
-                    #     # Log RGB
-                    #     show_img_pair(y_pred.detach().cpu().numpy(), y_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
-                    #             step=epoch_id, silhouette=False, prefix="")
-                    #     # Loss visulization
-                    #     loss_image = torch.abs(y_true * y_sil_true_col.unsqueeze(-1) - y_pred * y_sil_true_col.unsqueeze(-1))
-                    #     show_img_pair(loss_image.detach().cpu().numpy(), y_true.detach().cpu().numpy(), save_img_dir=base_output_dir,
-                    #             step=epoch_id, silhouette=False, prefix="loss_")
-                    
-
-                    
+                    if True:
+                        if rgb_map.isnan().any():
+                            print('rgb_map has nan')
+                            rgb_map[rgb_map.isnan()]=0.
+                        if disp_map.isnan().any():
+                            print('disp_map has nan')
+                            disp_map[disp_map.isnan()]=0.
+                        if acc_map.isnan().any():
+                            print('acc_map has nan')
+                            acc_map[acc_map.isnan()]=0.
+                        if weights.isnan().any():
+                            print('weights has nan')
+                            weights[weights.isnan()]=0.
+                        if rgb_map_0.isnan().any():
+                            print('rgb_map_0 has nan')
+                            rgb_map_0[rgb_map_0.isnan()]=0.
+                        if disp_map_0.isnan().any():
+                            print('disp_map_0 has nan')
+                            disp_map_0[disp_map_0.isnan()]=0.
+                        if acc_map_0.isnan().any():
+                            print('acc_map_0 has nan')
+                            acc_map_0[acc_map_0.isnan()]=0.
+                        if weights_0.isnan().any():
+                            print('weights_0 has nan')
+                            weights_0[weights_0.isnan()]=0.
+                            
 
                     # NOTE:New for hand_nerf: get rgb loss
                     loss_rgb = ((rgb_map-y_gt_choose)**2).mean()
@@ -1465,7 +1453,6 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                         loss['sparsity_reg_0']=torch.tensor(0.0, device=device)
 
                     if losses['smpl_reg']['weight'] > 0.:
-
                         inside_volume = signed_dist< 0
                         raw_inside_volume = all_ret['raw'].reshape(-1, 4)[inside_volume]
                         if inside_volume.sum() > 0:
@@ -1493,7 +1480,7 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
 
                     if SMLP_REG_DUMMY and losses['smpl_reg_dummy']['weight'] > 0. and np.random.rand()<0.5:
                         pts_dummy=torch.rand_like(pts)*2-1
-                        raw_smpl=render_kwargs_train['network_query_fn'](pts, None, render_kwargs_train['network_fn'])
+                        raw_smpl=render_kwargs_train['network_query_fn'](pts_dummy, None, render_kwargs_train['network_fn'])
                         v_shaped_canonical_normalize=canonical_coor_normalizer(hand_dict['v_shaped'].detach().reshape(-1,3),clamp=False).detach().reshape(-1,3)
                         mesh_v_shaped_canonical_normalize=Meshes(v_shaped_canonical_normalize.unsqueeze(0),params['mesh_faces'].unsqueeze(0).to(device))
                         mesh_v_shaped_canonical_normalize=mesh_subdivider(mesh_v_shaped_canonical_normalize)
@@ -1535,17 +1522,19 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                         loss['smpl_reg_dummy'] = smpl_reg_dummy
 
                         raw_smpl_0=render_kwargs_train['network_query_fn'](pts, None, render_kwargs_train['network_fine'])
+                        raw_inside_volume_smpl_dummy_0 = raw_smpl_0.reshape(-1, 4)[inside_volume_smpl_dummy]
+                        raw_outside_volume_smpl_dummy_0 = raw_smpl_0.reshape(-1, 4)[~inside_volume_smpl_dummy]
                         if inside_volume_smpl_dummy.sum() > 0:
                             smpl_reg_dummy_0 =  F.mse_loss(
-                                1 - torch.exp(-torch.relu(raw_inside_volume_smpl_dummy[:, 3])),
-                                torch.ones_like(raw_inside_volume_smpl_dummy[:, 3])
+                                1 - torch.exp(-torch.relu(raw_inside_volume_smpl_dummy_0[:, 3])),
+                                torch.ones_like(raw_inside_volume_smpl_dummy_0[:, 3])
                             )
                         else:
                             smpl_reg_dummy_0 = torch.tensor(0.0, device=device)
                         if ~inside_volume_smpl_dummy.sum() > 0:
                             smpl_reg_dummy_0 = smpl_reg_dummy_0 + F.mse_loss(
-                                torch.exp(-torch.relu(raw_outside_volume_smpl_dummy[:, 3])),
-                                torch.ones_like(raw_outside_volume_smpl_dummy[:, 3])
+                                torch.exp(-torch.relu(raw_outside_volume_smpl_dummy_0[:, 3])),
+                                torch.ones_like(raw_outside_volume_smpl_dummy_0[:, 3])
                             )
                         loss['smpl_reg_dummy_0'] = smpl_reg_dummy_0
                     else:
@@ -1590,12 +1579,15 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                 # Weighted sum of the losses
                 sum_loss = torch.tensor(0.0, device=device)
                 for k, l in loss.items():
-                    sum_loss += l * losses[k]["weight"]
+                    # if nan/inf in l, print k
+                    if torch.isnan(l) or torch.isinf(l):
+                        print(f'nan or inf in {k}')
+                    sum_loss += torch.nan_to_num(l, nan=0., posinf=1e-3, neginf=-1e-3) * losses[k]["weight"]
                     losses[k]["values"].append(float(l.detach().cpu()))
                     # tf_writer.add_scalar(k, l * losses[k]["weight"], n_iter)
                     if WANDB :
                         wandb.log({k: l * losses[k]["weight"]})
-                        if (mini_batch_count %100<4) and PATCH and APP_OPT:
+                        if (mini_batch_count %1000<4) and PATCH and APP_OPT:
                             # save rgb_map,rgb_map_0 and y_gt_choose
                             rgb_map_save=rgb_map.reshape(PATCH_SIZE,PATCH_SIZE,3).detach().cpu().numpy()
                             rgb_map_0_save=rgb_map_0.reshape(PATCH_SIZE,PATCH_SIZE,3).detach().cpu().numpy()
@@ -1624,12 +1616,14 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                     t14=time.time()
                     print(f't13-t14--zero grad:{t14-t13}')
                 sum_loss.backward()
+                
                 if TIME:
                     t15=time.time()
                     print(f't14-t15--backward:{t15-t14}')
                 if APP_OPT:
                     optimizer.step()
-                    nerf_scheduler.step()
+                    # nerf_scheduler.step()
+
                 if ADVERSARIAL:
                     discriminator_optimizer.step()
                     discriminator_scheduler.step()
@@ -1648,7 +1642,7 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                 # del rgb_map, disp_map, acc_map, weights, rgb_map_0, disp_map_0, acc_map_0, weights_0
                 # torch.cuda.empty_cache()
 
-                if LOG_IMGAGE and epoch_id % 1 == 0 and mini_batch_count == 0 and APP_OPT:
+                if LOG_IMGAGE and epoch_id % 10 == 0 and mini_batch_count == 0 and APP_OPT:
                 # if True:
                     with torch.no_grad():
                         if WANDB:
@@ -1724,7 +1718,7 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
         if epoch_id % 100 == 0 and epoch_id > 0:
             file_utils.save_result(params, base_output_dir, test=configs["known_appearance"])
 
-        if ((epoch_id % 50==0 and epoch_id>0 and TEST_VAL) or ONLY_TEST) and APP_OPT:
+        if ((epoch_id % 50==0 and epoch_id>50 and TEST_VAL)  and APP_OPT) or ONLY_TEST:
             # traverse val dataloader
             with torch.no_grad():
                 average_psnr_0=0
@@ -1732,9 +1726,10 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                 average_lpips_0=0
                 average_lpips=0
                 idx_val=0
-                ratio=1
-                val_output_basedir=os.path.join(args.basedir, args.expname, 'val_output')
+                ratio=5 if configs["total_epoch"]-epoch_id>2 and not ONLY_TEST  else 1
+                val_output_basedir=os.path.join(args.basedir, args.expname, 'val_output'+('_val_3_4' if TEST_VAL else ''))
                 os.makedirs(val_output_basedir,exist_ok=True)
+                print(f'val_output_basedir:{val_output_basedir}')
                 try:
                     for (fid, y_true, y_sil_true, 
                         y_sil_true_ero, y_sil_true_dil) in (tqdm(val_images_dataloader,desc='Running validation')):
@@ -1753,7 +1748,7 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                         rgb_all_0,rgb_all=render_whole_image(args,val_params,H,W,
                                                             configs,hand_verts,faces,fid,
                                                             render_kwargs_test,hand_dict,
-                                                            canonical_coor_normalizer,hand_joints,(y_sil_true_dil>0.).squeeze(0),device)
+                                                            canonical_coor_normalizer,hand_joints,(y_sil_true>0.).squeeze(0),device)
                         # save to wandb, with gt
                         if WANDB and idx_val%1==0:
                             wandb.log({"rgb_all_0_val": wandb.Image(rgb_all_0.detach().cpu().numpy(), caption="rgb_all_0_val")})
@@ -1792,8 +1787,10 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                         average_lpips_0+=lpips_0
                         average_lpips+=lpips_
                         idx_val+=1
-                except:
+                except Exception as e:
                     print('error in val')
+                    # print(e)
+                    raise e
                 average_psnr_0=average_psnr_0/len(val_images_dataloader)*ratio
                 average_psnr=average_psnr/len(val_images_dataloader)*ratio
                 average_lpips_0=average_lpips_0/len(val_images_dataloader)*ratio
@@ -1826,7 +1823,7 @@ def optimize_hand_sequence(configs, input_params, images_dataset, val_params, va
                     images=[]
                     for filename in filenames:
                         images.append(imageio.imread(filename))
-                    imageio.mimsave(filename,images,fps=25)
+                    imageio.mimsave(filename,images,fps=30)
 
                 if ONLY_TEST:return
 
@@ -1866,3 +1863,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# WANDB_MODE=offline CUDA_VISIBLE_DEVICES=1 python optimize_sequence_nerf.py --config DS_NeRF/configs/config.txt
