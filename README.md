@@ -65,7 +65,7 @@ The code is tested on Ubuntu 20.04 with python 3.8 and 3.9.
 ### Preprocessed sequence
 - Download the sample preprocessed sequence from [here](https://drive.google.com/file/d/1KLMvehpEAXR8lkjHHX4q4E6mgAHOTwM3/view?usp=sharing)
 - Put the data in ```../data/```. The path can be changed in ```utils/config_utils.py```.
-- Released data (from one subject, with different appearance variations) can be found [here](https://polybox.ethz.ch/index.php/s/EDvgrNXiOLNyPYp)
+- Released data (from one subject, with different appearance variations) can be found [here](https://drive.google.com/file/d/1HirnmHCFMUr0keNKzt0no5ltmrUq2MHe/view?usp=sharing)
 
 ### Running the optimization
 To start optimizing the sequence from the coarse initialization, run:
